@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, appendFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, appendFile, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -125,7 +125,8 @@ try {
   await writeFile(legacyCredentialHelper, LEGACY_NATIVE_CREDENTIAL_SOURCE, { mode: 0o600 });
   await writeFile(linkedConfig, originalCodexConfig);
   await rm(configPath);
-  await symlink(linkedConfig, configPath);
+  if (process.platform === "win32") await link(linkedConfig, configPath);
+  else await symlink(linkedConfig, configPath);
   result = (await rpc("tools/call", { name: "deepseek_settings_save", arguments: { expectedRevision: 1, model: "deepseek-mock-a" } })).result;
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /non-regular or multiply linked Codex config/);

@@ -54,7 +54,8 @@ async function privatePermissions(path, mode) {
 
 function sameSnapshot(actual, expected) {
   return actual.exists === expected.exists && (!actual.exists ||
-    actual.contents === expected.contents && actual.mode === expected.mode && actual.dev === expected.dev && actual.ino === expected.ino);
+    actual.contents === expected.contents && (process.platform === "win32" || actual.mode === expected.mode) &&
+    actual.dev === expected.dev && actual.ino === expected.ino);
 }
 
 async function atomicWrite(path, contents, mode = 0o600, expectedSnapshot = null) {
@@ -71,7 +72,7 @@ async function atomicWrite(path, contents, mode = 0o600, expectedSnapshot = null
     await rename(temporary, path);
     await privatePermissions(path, mode);
     const committed = await fileSnapshot(path);
-    if (!committed.exists || committed.contents !== contents || committed.mode !== mode) {
+    if (!committed.exists || committed.contents !== contents || process.platform !== "win32" && committed.mode !== mode) {
       throw new Error(`Plugin file commit could not be verified: ${path}`);
     }
     return committed;
@@ -605,7 +606,7 @@ export async function reconcileNativeCleanup(settingsDir, now = Date.now()) {
     if (!(cleanup.status === "failed" || cleanup.deadlineExceeded)) {
       return { reconciled: false, reason: cleanup.status, cleanup };
     }
-    await removeNativeIntegrationUnlocked(settingsDir, { deferMacCleanup: false });
+    await removeNativeIntegrationUnlocked(settingsDir, { deferCleanup: false });
     return { reconciled: true, reason: cleanup.failureCode || cleanup.status, cleanup };
   });
 }

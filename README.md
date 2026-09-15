@@ -18,14 +18,15 @@ a shell command. / 将下面这段话直接发给 Codex。Codex 应保留已有�
    如果 `deepseek-team` 已存在，则运行
    `codex plugin marketplace upgrade deepseek-team`。
 3. 运行 `codex plugin add deepseek-subagent@deepseek-team`。
-4. 在 macOS 上检查 `~/.codex/config.toml`，仅在缺失时加入
+4. 检查 Codex 配置（默认是用户目录下的 `.codex/config.toml`），仅在缺失时加入
    `[features.multi_agent_v2]` 和 `enabled = true`，保留其他现有配置。
 5. 不要向我索取或代填 DeepSeek API Key。安装完成后，让我亲自在
    Settings → Integrations → DeepSeek Subagent 中填写 Key、刷新模型并保存模型。
 6. 提醒我保存模型后新建一个 Codex 任务，再用原生 DeepSeek 子智能体做一次测试；
    正常委派不应打开 Settings 页面。
-7. 如果当前系统不是 macOS，明确说明设置、连接测试和模型发现仍可使用，
-   但原生 DeepSeek 子智能体路由目前不可用。
+7. 确认原生路由状态为“已就绪”。macOS 使用用户级 LaunchAgent；Windows 和
+   Linux 使用无需管理员权限的用户级后台 router。任何平台都不得把启动成功当成
+   委派成功，必须在新任务中完成一次真实的 DeepSeek 子智能体测试。
 ```
 
 Direct Git marketplace commands / 直接使用 Git marketplace 的命令：
@@ -53,7 +54,8 @@ codex plugin add deepseek-subagent@deepseek-team
    将 `<absolute-repository-path>` 替换为本仓库绝对路径。Windows 可使用
    `C:\...\codex-deepseek-subagent`。
 
-4. On macOS, enable Codex Multi-Agent v2 in `~/.codex/config.toml`:
+4. On macOS, Windows, or Linux, enable Codex Multi-Agent v2 in the active
+   `CODEX_HOME/config.toml` (normally `.codex/config.toml` under your user home):
 
    ```toml
    [features.multi_agent_v2]
@@ -68,12 +70,15 @@ codex plugin add deepseek-subagent@deepseek-team
    current Codex releases reject it in strict config mode.
 5. Start a Codex task, open **Settings → Integrations → DeepSeek Subagent**,
    save the key and model, then start one new task. Saving the model installs a
-   user LaunchAgent and a marked, reversible loopback provider route. / 先按第
-   4 步启用 Multi-Agent v2；再打开设置页保存 key 和模型。保存模型会安装用户级
-   LaunchAgent 与带标记、可恢复的本机 provider 路由，随后新建一个任务。
+   user-scoped router and a marked, reversible loopback provider route. macOS
+   uses LaunchAgent; Windows and Linux use an authenticated detached process
+   that requires no administrator privileges. / 先按第 4 步启用 Multi-Agent v2；
+   再打开设置页保存 key 和模型。保存模型会安装用户级 router 与带标记、可恢复的
+   本机 provider 路由；macOS 使用 LaunchAgent，Windows/Linux 使用无需管理员权限的
+   受认证后台进程。随后新建一个任务。
 
-The native routing integration currently supports macOS and requires a current
-Codex release with custom agents and native subagent workflows. The effective
+The native routing integration supports macOS, Windows, and Linux and requires
+a current Codex release with custom agents and native subagent workflows. The effective
 provider becomes a loopback router: parent requests are forwarded to the
 upstream resolved from the active ChatGPT-authenticated provider, while
 requests whose model matches the selected DeepSeek model are sent to DeepSeek.
@@ -105,8 +110,8 @@ catalog while `deepseek-flash` is registered as text-and-image capable.
 Custom providers with unsupported routing or header fields are rejected rather
 than silently changing their data path.
 
-原生路由目前支持 macOS，并依赖支持 custom agents 与原生 subagent workflow 的
-新版 Codex。生效后的 provider 是本机 loopback router：父任务转发至当前 provider
+原生路由支持 macOS、Windows 与 Linux，并依赖支持 custom agents 与原生 subagent
+workflow 的新版 Codex。生效后的 provider 是本机 loopback router：父任务转发至当前 provider
 解析出的原上游；请求模型与所选 DeepSeek 模型一致时才会发往 DeepSeek。若自定义
 provider 含无法安全保留的路由或 header 字段，插件会拒绝启用，不会静默改变数据出口。
 Codex 会按 ChatGPT provider 加密原生协作消息正文，因此 skill 会先通过插件的本地
@@ -133,13 +138,16 @@ is sent to DeepSeek. A delegated provider payload may include the task message,
 model context, tool definitions/results, and attachments. Deleting the key
 immediately disables DeepSeek and restores the previous provider for new tasks;
 parent pass-through remains available for already-open tasks for up to ten
-minutes. A conflicting LaunchAgent path or registered label is left untouched
-unless its exact plugin ownership and arguments can be verified. / 路由仅监听
+minutes. On macOS, a conflicting LaunchAgent path or registered label is left
+untouched unless its exact plugin ownership and arguments can be verified. On
+Windows and Linux, the router accepts shutdown only through its random local
+capability and verifies the running instance before replacement. / 路由仅监听
 `127.0.0.1`，不记录请求正文或认证头；发往 DeepSeek 前会替换
 父任务授权。委派 payload 可能包含任务消息、模型上下文、工具定义/结果和附件。删除
 Key 会立即禁用 DeepSeek、为新任务恢复原 provider，并为已打开任务保留最长十分钟的
-父请求透传。若固定 LaunchAgent 路径或 label 已被其他程序占用且无法验证插件所有权，
-插件会保持原状并拒绝覆盖或停止该服务。
+父请求透传。macOS 上若固定 LaunchAgent 路径或 label 已被其他程序占用且无法验证插件
+所有权，插件会保持原状并拒绝覆盖或停止该服务；Windows/Linux 只通过随机本机
+capability 关闭 router，并在替换前验证运行实例。
 
 The delegation control-plane call is part of normal Codex tool history, so its
 arguments may be retained by Codex even though the router never writes the
@@ -162,15 +170,29 @@ regenerates and loads the refreshed router, native role, and skill.
 ## Uninstall / 卸载
 
 Before removing the plugin, either use **Delete key** in its settings page or
-run the independently installed cleanup command below. The standalone copy is
+run the independently installed cleanup command for your platform below. The standalone copy is
 written when a model is saved and still works if the plugin source has already
 been removed:
+
+macOS:
 
 ```sh
 node "$HOME/Library/Application Support/DeepSeek Subagent/cleanup.mjs"
 ```
 
-The standalone command immediately stops the owned LaunchAgent, restores the
+Linux:
+
+```sh
+node "${XDG_CONFIG_HOME:-$HOME/.config}/deepseek-subagent/cleanup.mjs"
+```
+
+Windows PowerShell:
+
+```powershell
+node "$env:APPDATA\DeepSeek Subagent\cleanup.mjs"
+```
+
+The standalone command immediately stops the owned router service/process, restores the
 previous Codex provider, and removes the credential, native role, router state,
 and cleanup support files. Start a new Codex task, then uninstall the plugin.
 It refuses to delete conflicting files whose plugin ownership cannot be
@@ -184,10 +206,10 @@ after removing the damaged file. Never share the backup because it may contain
 the API key.
 
 卸载插件前，请先在设置页点击**删除 Key**，或执行上面的独立清理命令。保存模型时会把
-该命令安装到用户设置目录，所以即使插件源码已经删除，它仍可执行。独立清理会立即停止
-插件所有的 LaunchAgent、恢复原 Codex provider，并删除凭据、原生 role、router 状态和
-清理支持文件；随后新建 Codex 任务，再卸载插件。无法验证插件所有权的冲突文件不会被
-删除。
+该命令安装到用户设置目录，所以即使插件源码已经删除，它仍可执行。请按当前系统使用
+上方对应命令。独立清理会立即停止插件所有的 router 服务或进程、恢复原 Codex provider，
+并删除凭据、原生 role、router 状态和清理支持文件；随后新建 Codex 任务，再卸载插件。
+无法验证插件所有权的冲突文件不会被删除。
 
 如果设置页提示 `settings.json` 已损坏，请关闭 Codex；如确有需要先做私密备份，然后只
 删除插件 README 所列平台目录中的 DeepSeek Subagent `settings.json`。重新打开设置页会

@@ -209,7 +209,7 @@
             updateKey: "Update API key", updateKeyHelp: "The input is cleared after the key is saved to the private local settings file.", save: "Save",
             connectionTest: "Connection test", connectionTestHelp: "Refreshes models and tests the selected Responses model with a tiny request.", test: "Test connection", delete: "Delete key",
             secretNote: "The key is stored only in the private local settings file and is sent as authorization only to the configured DeepSeek API. Parent authorization is never forwarded to DeepSeek.", nativeAgent: "Native child task", defaultModel: "Default model",
-            modelHelp: "Shows DeepSeek GET /v1/models plus deepseek-flash; the selected model is verified through Responses when saved.", nativeStatus: "Native routing", nativeHelp: "Requires [features.multi_agent_v2] enabled = true in Codex config, then installs a macOS LaunchAgent and loopback provider router. hide_spawn_agent_metadata = false is optional and only controls metadata visibility.", nativeReady: "Ready", nativeMissing: "Setup required", restartNote: "A delegated request may send its task message, model context, tool definitions/results, and attachments to DeepSeek. Saving or updating a model requires Save model again, then a new Codex task. Before uninstalling, delete the key here or run the independent cleanup command documented in the README. Deleting the key disables DeepSeek immediately, restores new tasks, and keeps parent pass-through alive for up to 10 minutes for already-open tasks.", refresh: "Refresh", configureFirst: "Configure an API key first", noModels: "No models returned",
+            modelHelp: "Shows DeepSeek GET /v1/models plus deepseek-flash; the selected model is verified through Responses when saved.", nativeStatus: "Native routing", nativeHelp: "Requires [features.multi_agent_v2] enabled = true in Codex config, then installs a user-scoped loopback provider router on macOS, Windows, or Linux. hide_spawn_agent_metadata = false is optional and only controls metadata visibility.", nativeReady: "Ready", nativeMissing: "Setup required", restartNote: "A delegated request may send its task message, model context, tool definitions/results, and attachments to DeepSeek. Saving or updating a model requires Save model again, then a new Codex task. Before uninstalling, delete the key here or run the independent cleanup command documented in the README. Deleting the key disables DeepSeek immediately, restores new tasks, and keeps parent pass-through alive for up to 10 minutes for already-open tasks.", refresh: "Refresh", configureFirst: "Configure an API key first", noModels: "No models returned",
             loading: "Loading settings…", ready: "Settings ready.", savingKey: "Saving API key…", keySaved: "API key saved and models refreshed.",
             deleting: "Deleting API key…", deleted: "API key deleted.", refreshing: "Refreshing model list…", refreshed: "Model list refreshed.",
             testing: "Testing DeepSeek connection…", tested: "Connection succeeded.", savingModel: "Saving default model…", modelSaved: "Model saved. Start a new Codex task.",
@@ -220,8 +220,8 @@
             errInvalidResponse: "DeepSeek returned an invalid response.", errNativeNotReady: "Native routing is not ready. Save the model again, then start a new Codex task.",
             errRouter: "The local DeepSeek router is unavailable. Save the model again.", errNativeIntegration: "Codex native routing could not be updated safely.",
             errMultiAgent: "Enable Codex Multi-Agent v2, then save the model again.", errProviderAuth: "The active Codex provider is not ChatGPT-authenticated. Restore a supported parent provider first.",
-            errProviderUnsupported: "The active Codex provider configuration cannot be routed safely.", errPlatformUnsupported: "Native DeepSeek routing is currently supported on macOS only.",
-            errOwnership: "A routing or LaunchAgent file is owned by another process. The plugin left it unchanged.",
+            errProviderUnsupported: "The active Codex provider configuration cannot be routed safely.", errPlatformUnsupported: "Native DeepSeek routing requires macOS, Windows, or Linux.",
+            errOwnership: "A routing file, service, or process is owned by another program. The plugin left it unchanged.",
           },
           zh: {
             lead: "为 Codex 原生子任务配置 DeepSeek。本机 loopback 路由保留父任务 provider，并把请求模型与所选 DeepSeek 模型一致的请求转发给 DeepSeek。",
@@ -229,7 +229,7 @@
             updateKey: "更新 API key", updateKeyHelp: "Key 会保存到私有本机设置文件，保存后仅清空输入框。", save: "保存",
             connectionTest: "连接测试", connectionTestHelp: "刷新模型，并用极小请求测试已选 Responses 模型。", test: "测试连接", delete: "删除 Key",
             secretNote: "Key 仅持久化在私有本机设置文件，并只作为认证发送给所配置的 DeepSeek API；父任务授权绝不会转发给 DeepSeek。", nativeAgent: "原生子任务", defaultModel: "默认模型",
-            modelHelp: "显示 DeepSeek GET /v1/models 返回的模型及 deepseek-flash；保存时会通过 Responses 验证所选模型。", nativeStatus: "原生路由", nativeHelp: "要求 Codex 配置 [features.multi_agent_v2] enabled = true，然后安装 macOS LaunchAgent 与本机 provider 路由。hide_spawn_agent_metadata = false 仅控制元数据是否可见，可选。", nativeReady: "已就绪", nativeMissing: "需要设置", restartNote: "委派请求可能把任务消息、模型上下文、工具定义/结果及附件发送给 DeepSeek。安装或更新后必须再次保存模型，再新建 Codex 任务。卸载插件前必须在此删除 Key，或执行 README 中的独立清理命令。删除 Key 会立即禁用 DeepSeek、为新任务恢复 provider，并为已打开任务保留最长 10 分钟的父请求透传。", refresh: "刷新", configureFirst: "请先配置 API key", noModels: "接口未返回模型",
+            modelHelp: "显示 DeepSeek GET /v1/models 返回的模型及 deepseek-flash；保存时会通过 Responses 验证所选模型。", nativeStatus: "原生路由", nativeHelp: "要求 Codex 配置 [features.multi_agent_v2] enabled = true，然后在 macOS、Windows 或 Linux 上安装用户级本机 provider 路由。hide_spawn_agent_metadata = false 仅控制元数据是否可见，可选。", nativeReady: "已就绪", nativeMissing: "需要设置", restartNote: "委派请求可能把任务消息、模型上下文、工具定义/结果及附件发送给 DeepSeek。安装或更新后必须再次保存模型，再新建 Codex 任务。卸载插件前必须在此删除 Key，或执行 README 中的独立清理命令。删除 Key 会立即禁用 DeepSeek、为新任务恢复 provider，并为已打开任务保留最长 10 分钟的父请求透传。", refresh: "刷新", configureFirst: "请先配置 API key", noModels: "接口未返回模型",
             loading: "正在加载设置…", ready: "设置已就绪。", savingKey: "正在保存 API key…", keySaved: "API key 已保存，模型列表已刷新。",
             deleting: "正在删除 API key…", deleted: "API key 已删除。", refreshing: "正在刷新模型列表…", refreshed: "模型列表已刷新。",
             testing: "正在测试 DeepSeek 连接…", tested: "连接成功。", savingModel: "正在保存默认模型…", modelSaved: "模型已保存，请新建 Codex 任务。",
@@ -240,8 +240,8 @@
             errInvalidResponse: "DeepSeek 返回了无效响应。", errNativeNotReady: "原生路由尚未就绪，请重新保存模型并新建 Codex 任务。",
             errRouter: "本机 DeepSeek 路由不可用，请重新保存模型。", errNativeIntegration: "无法安全更新 Codex 原生路由。",
             errMultiAgent: "请启用 Codex Multi-Agent v2，然后重新保存模型。", errProviderAuth: "当前 Codex provider 不是 ChatGPT 认证的 provider，请先恢复受支持的父 provider。",
-            errProviderUnsupported: "当前 Codex provider 配置无法被安全路由。", errPlatformUnsupported: "DeepSeek 原生路由目前仅支持 macOS。",
-            errOwnership: "路由或 LaunchAgent 文件属于其他程序，插件已保持其不变。",
+            errProviderUnsupported: "当前 Codex provider 配置无法被安全路由。", errPlatformUnsupported: "DeepSeek 原生路由需要 macOS、Windows 或 Linux。",
+            errOwnership: "路由文件、服务或进程属于其他程序，插件已保持其不变。",
           },
         };
         const pending = new Map();
@@ -308,7 +308,7 @@
         async function initializeBridge() {
           if (!bridgeReady) bridgeReady = (async () => {
             const result = await rpcRequest("ui/initialize", {
-              appInfo: { name: "DeepSeek Subagent", version: "0.5.0+codex.20260915101428" },
+              appInfo: { name: "DeepSeek Subagent", version: "0.5.0+codex.20260915113133" },
               appCapabilities: {},
               protocolVersion: PROTOCOL_VERSION,
             }, 8000);

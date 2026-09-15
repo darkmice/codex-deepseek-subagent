@@ -33,7 +33,8 @@ function exactTestSettings(paths) {
 }
 
 function testOverridesEnabled(paths) {
-  return exactTestSettings(paths) && paths.launchAgentLabel !== DEFAULT_LAUNCH_AGENT_LABEL;
+  return exactTestSettings(paths) && (paths.launchAgentLabel !== DEFAULT_LAUNCH_AGENT_LABEL ||
+    ["darwin", "linux", "win32"].includes(process.env.DEEPSEEK_SUBAGENT_TEST_PLATFORM || ""));
 }
 
 function launchAgentLabel(paths) {
@@ -44,9 +45,17 @@ function directRuntimeMode(paths) {
   return exactTestSettings(paths) && process.env.DEEPSEEK_SUBAGENT_RUNTIME_MODE === "direct";
 }
 
+function runtimePlatform(paths) {
+  const testPlatform = exactTestSettings(paths) ? process.env.DEEPSEEK_SUBAGENT_TEST_PLATFORM || "" : "";
+  return ["darwin", "linux", "win32"].includes(testPlatform) ? testPlatform : process.platform;
+}
+
 export function runtimeExecutionMode(paths) {
   if (directRuntimeMode(paths)) return "direct-test";
-  return process.platform === "darwin" ? "launchagent" : "unsupported";
+  const platform = runtimePlatform(paths);
+  if (platform === "darwin") return "launchagent";
+  if (platform === "linux" || platform === "win32") return "detached";
+  return "unsupported";
 }
 
 function blockPattern(begin, end) {
@@ -635,9 +644,17 @@ async function acquireRuntimeMutationLock(paths) {
       throw new Error(`Refusing to use an unsafe DeepSeek runtime lock file: ${paths.routerLockDir}`);
     }
     await handle.chmod(0o600);
-    const command = process.platform === "darwin" ? "/usr/bin/lockf" : process.platform === "linux" ? "/usr/bin/flock" : "";
-    const args = process.platform === "darwin" ? ["-s", "-t", "60", "3"] : ["-w", "60", "3"];
-    if (!command) throw new Error("Native DeepSeek runtime locking is supported only on macOS and Linux.");
+    const platform = process.platform;
+    if (platform === "win32") {
+      // Native installs/removals and the deferred cleanup worker also hold the
+      // cross-platform settings mutation lock. Windows has no lockf/flock;
+      // retaining this verified handle keeps the runtime lock path stable
+      // while that outer lock serializes the mutation.
+      return handle;
+    }
+    const command = platform === "darwin" ? "/usr/bin/lockf" : platform === "linux" ? "/usr/bin/flock" : "";
+    const args = platform === "darwin" ? ["-s", "-t", "60", "3"] : ["-w", "60", "3"];
+    if (!command) throw new Error("Native DeepSeek runtime locking is unavailable on this platform.");
     const locker = spawn(command, args, { stdio: ["ignore", "ignore", "ignore", handle.fd] });
     const code = await new Promise((resolve, reject) => {
       locker.once("error", reject);
@@ -811,7 +828,7 @@ async function bootstrapOwnedLaunchAgent(paths, domain, expectedExecutable) {
 }
 
 async function assertLaunchAgentOwnership(paths, launchAgentSnapshot, runtime = null) {
-  if (process.platform !== "darwin" || directRuntimeMode(paths)) return { executable: process.execPath, service: null };
+  if (runtimePlatform(paths) !== "darwin" || directRuntimeMode(paths)) return { executable: process.execPath, service: null };
   const plistExecutable = launchAgentSnapshot.exists ? ownedLaunchAgentExecutable(launchAgentSnapshot.contents, paths) : null;
   if (launchAgentSnapshot.exists && !plistExecutable) {
     throw new Error(`Refusing to overwrite or remove an unmanaged LaunchAgent: ${paths.launchAgentFile}`);
@@ -824,14 +841,93 @@ async function assertLaunchAgentOwnership(paths, launchAgentSnapshot, runtime = 
   return { executable: executable || process.execPath, service };
 }
 
+function runtimeIdentityValid(runtime) {
+  return runtime?.schemaVersion === 2 && Number.isInteger(runtime.port) && runtime.port >= 1024 && runtime.port <= 65535 &&
+    /^[a-f0-9]{48}$/.test(runtime.routeToken || "") && /^[a-f0-9]{48}$/.test(runtime.instanceId || "") &&
+    /^[a-f0-9]{48}$/.test(runtime.shutdownToken || "");
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) {
+    if (error?.code === "EPERM") return true;
+    if (error?.code === "ESRCH") return false;
+    return false;
+  }
+}
+
+async function runtimeHealth(runtime, timeout = 800) {
+  if (!runtimeIdentityValid(runtime)) return null;
+  try {
+    const response = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/healthz`, {
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (!response.ok) return null;
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > 4096) return null;
+    const health = JSON.parse(text);
+    return health?.status === "ok" && health.instanceId === runtime.instanceId ? health : null;
+  } catch { return null; }
+}
+
+async function stopDetachedRuntime(runtime) {
+  if (!runtimeIdentityValid(runtime)) return false;
+  const health = await runtimeHealth(runtime);
+  if (!health) return false;
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/control/shutdown`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${runtime.shutdownToken}`, "content-length": "0" },
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch (error) {
+    throw new Error("Unable to stop the managed DeepSeek detached router.", { cause: error });
+  }
+  if (response.status !== 202) throw new Error("Managed DeepSeek detached router rejected its authenticated shutdown request.");
+  for (let attempt = 0; attempt < 80; attempt++) {
+    if (!await runtimeHealth(runtime, 250)) return true;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error("Timed out waiting for the managed DeepSeek detached router to stop.");
+}
+
+async function spawnDetachedRuntime(nodeExecutable, paths) {
+  const child = spawn(nodeExecutable, [paths.runtimeModuleFile, "--deepseek-detached-host", paths.routerFile, paths.runtimeFile], {
+    stdio: "ignore",
+    detached: true,
+    windowsHide: true,
+  });
+  await new Promise((resolve, reject) => {
+    const onSpawn = () => { child.off("error", onError); resolve(); };
+    const onError = (error) => { child.off("spawn", onSpawn); reject(error); };
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
+  });
+  child.unref();
+  return child;
+}
+
 async function startRuntime(paths, nodeExecutable, launchAgentSnapshot, previousRuntime, recovery) {
   if (directRuntimeMode(paths)) {
     const child = spawn(nodeExecutable, [paths.routerFile, paths.runtimeFile], { stdio: "ignore", detached: false });
     child.unref();
+    recovery.startedChild = child;
     return child.pid;
   }
-  if (process.platform !== "darwin") {
-    throw new Error("Native provider routing currently requires macOS LaunchAgents.");
+  const mode = runtimeExecutionMode(paths);
+  if (mode === "detached") {
+    recovery.priorRuntime = previousRuntime;
+    recovery.priorServiceExists = Boolean(await runtimeHealth(previousRuntime));
+    recovery.priorExecutable = typeof previousRuntime?.nodeExecutable === "string" ? previousRuntime.nodeExecutable : "";
+    if (recovery.priorServiceExists) await stopDetachedRuntime(previousRuntime);
+    const child = await spawnDetachedRuntime(nodeExecutable, paths);
+    recovery.startedChild = child;
+    return child.pid;
+  }
+  if (mode !== "launchagent") {
+    throw new Error("Native provider routing is unavailable on this platform.");
   }
   const ownership = await assertLaunchAgentOwnership(paths, launchAgentSnapshot, previousRuntime);
   recovery.priorServiceExists = ownership.service?.exists === true;
@@ -851,8 +947,8 @@ async function startRuntime(paths, nodeExecutable, launchAgentSnapshot, previous
   return null;
 }
 
-async function scheduleLaunchAgentCleanup(
-  paths, runtime, runtimeSnapshot, launchAgentSnapshot, launchAgentExecutable, cleanupExecutable = process.execPath, cleanupSupportSnapshots = [],
+async function scheduleRuntimeCleanup(
+  paths, runtime, runtimeSnapshot, serviceSnapshot, serviceExecutable, cleanupExecutable = process.execPath, cleanupSupportSnapshots = [],
 ) {
   if (!runtimeSnapshot.exists) throw new Error("Cannot schedule deferred DeepSeek cleanup without managed runtime state.");
   const cleanupToken = randomBytes(24).toString("hex");
@@ -878,7 +974,10 @@ async function scheduleLaunchAgentCleanup(
   const cleanupContents = `${JSON.stringify(cleanupRuntime, null, 2)}\n`;
   await atomicWrite(paths.runtimeFile, cleanupContents, runtimeSnapshot.mode, runtimeSnapshot);
   const cleanupSnapshot = await fileSnapshot(paths.runtimeFile);
-  const target = `gui/${userInfo().uid}/${launchAgentLabel(paths)}`;
+  const executionMode = runtimeExecutionMode(paths);
+  const target = executionMode === "launchagent"
+    ? `gui/${userInfo().uid}/${launchAgentLabel(paths)}`
+    : `detached/${runtime.instanceId}`;
   const cleanupSupportManifest = cleanupSupportSnapshots.filter((snapshot) => snapshot.exists).map((snapshot) => ({
     path: snapshot.path,
     sha256: createHash("sha256").update(snapshot.contents).digest("hex"),
@@ -891,7 +990,7 @@ const {execFile,spawn}=require("node:child_process");
 const {createHash,randomBytes}=require("node:crypto");
 const {constants}=require("node:fs");
 const {chmod,readFile,open,lstat,mkdir,rename,rm,utimes,writeFile}=require("node:fs/promises");
-const [runtimeFile,routerFile,lockDir,mutationLock,launchAgentFile,settingsFile,target,nodeExecutable,token,delayText,retryDelayText,maxAttemptsText,lockTimeoutText,supportManifestText]=process.argv.slice(1);
+const [runtimeFile,routerFile,lockDir,mutationLock,launchAgentFile,settingsFile,target,executionMode,nodeExecutable,token,delayText,retryDelayText,maxAttemptsText,lockTimeoutText,supportManifestText]=process.argv.slice(1);
 const delay=Number.parseInt(delayText,10);
 const retryDelay=Number.parseInt(retryDelayText,10);
 const maxAttempts=Number.parseInt(maxAttemptsText,10);
@@ -910,7 +1009,12 @@ const acquireRuntime=async()=>{
     const pathInfo=await lstat(lockDir);
     if(!info.isFile()||info.nlink!==1||pathInfo.isSymbolicLink()||!pathInfo.isFile()||pathInfo.dev!==info.dev||pathInfo.ino!==info.ino)throw new Error("unsafe lock");
     await handle.chmod(0o600);
-    const locker=spawn("/usr/bin/lockf",["-s","-t",String(Math.max(0,Math.ceil(lockTimeout/1000))),"3"],{stdio:["ignore","ignore","ignore",handle.fd]});
+    if(process.platform==="win32")return handle;
+    const lockCommand=process.platform==="darwin"?"/usr/bin/lockf":"/usr/bin/flock";
+    const lockArgs=process.platform==="darwin"
+      ?["-s","-t",String(Math.max(0,Math.ceil(lockTimeout/1000))),"3"]
+      :["-w",String(Math.max(0,Math.ceil(lockTimeout/1000))),"3"];
+    const locker=spawn(lockCommand,lockArgs,{stdio:["ignore","ignore","ignore",handle.fd]});
     const code=await new Promise((resolve,reject)=>{locker.once("error",reject);locker.once("exit",(exitCode,signal)=>signal?reject(new Error("lock helper signal")):resolve(exitCode));});
     if(code!==0)throw coded("lock_unavailable");
     return handle;
@@ -1049,17 +1153,46 @@ const cleanupOnce=async(attempt)=>{
   const inject=testOverridesEnabled&&process.env.DEEPSEEK_SUBAGENT_TEST_DEFERRED_FAIL_ONCE===target;
   if(testOverridesEnabled&&process.env.DEEPSEEK_SUBAGENT_TEST_DEFERRED_ALWAYS_FAIL===target)throw coded("injected_persistent_failure");
   if(inject&&!globalThis.__deepseekCleanupInjected){globalThis.__deepseekCleanupInjected=true;throw coded("injected_failure");}
-  const status=await run(["print",target]);
-  if(status.error){
-    if(!serviceNotFound(status.stderr||status.error.message))throw coded("launchctl_status_failed");
-  }else{
-    if(![nodeExecutable,routerFile,runtimeFile].every((value)=>String(status.stdout||"").includes(value)))throw coded("service_ownership_changed");
-    const bootout=await run(["bootout",target]);
-    if(bootout.error&&!serviceNotFound(bootout.stderr||bootout.error.message))throw coded("launchctl_bootout_failed");
-    const after=await run(["print",target]);
-    if(!after.error||!serviceNotFound(after.stderr||after.error.message))throw coded("service_still_running");
-  }
-  await assertMissing(launchAgentFile,"launchagent_plist_reappeared");
+  if(executionMode==="launchagent"){
+    const status=await run(["print",target]);
+    if(status.error){
+      if(!serviceNotFound(status.stderr||status.error.message))throw coded("launchctl_status_failed");
+    }else{
+      if(![nodeExecutable,routerFile,runtimeFile].every((value)=>String(status.stdout||"").includes(value)))throw coded("service_ownership_changed");
+      const bootout=await run(["bootout",target]);
+      if(bootout.error&&!serviceNotFound(bootout.stderr||bootout.error.message))throw coded("launchctl_bootout_failed");
+      const after=await run(["print",target]);
+      if(!after.error||!serviceNotFound(after.stderr||after.error.message))throw coded("service_still_running");
+    }
+    await assertMissing(launchAgentFile,"launchagent_plist_reappeared");
+  }else if(executionMode==="detached"){
+    const healthUrl="http://127.0.0.1:"+runtime.port+"/"+runtime.routeToken+"/healthz";
+    const shutdownUrl="http://127.0.0.1:"+runtime.port+"/"+runtime.routeToken+"/control/shutdown";
+    let reachable=false;
+    try{
+      const health=await fetch(healthUrl,{signal:AbortSignal.timeout(800)});
+      if(health.ok){
+        const value=await health.json();
+        if(value&&value.status==="ok"&&value.instanceId===runtime.instanceId)reachable=true;
+        else throw coded("service_ownership_changed");
+      }
+    }catch(error){if(error&&error.cleanupCode)throw error;}
+    if(reachable){
+      const stopped=await fetch(shutdownUrl,{method:"POST",headers:{authorization:"Bearer "+runtime.shutdownToken,"content-length":"0"},signal:AbortSignal.timeout(3000)});
+      if(stopped.status!==202)throw coded("service_shutdown_failed");
+      for(let check=0;check<80;check++){
+        await sleep(50);
+        try{
+          const health=await fetch(healthUrl,{signal:AbortSignal.timeout(250)});
+          if(health.ok)continue;
+        }catch{return await finishDetachedCleanup();}
+      }
+      throw coded("service_still_running");
+    }
+  }else throw coded("runtime_mode_invalid");
+  return await finishDetachedCleanup();
+};
+const finishDetachedCleanup=async()=>{
   await rm(routerFile,{force:true});
   await assertMissing(routerFile,"router_remove_failed");
   if(!(await loadRuntime()))return "superseded";
@@ -1098,7 +1231,7 @@ setTimeout(async()=>{
   try {
     const cleanup = spawn(cleanupExecutable, [
       "-e", cleanupSource, paths.runtimeFile, paths.routerFile, paths.routerLockDir, join(dirname(paths.settingsFile), ".mutation.lock"),
-      paths.launchAgentFile, paths.settingsFile, target, launchAgentExecutable, cleanupToken, String(delayMs), String(retryDelayMs),
+      paths.launchAgentFile, paths.settingsFile, target, executionMode, serviceExecutable, cleanupToken, String(delayMs), String(retryDelayMs),
       String(maxAttempts), String(lockTimeoutMs), JSON.stringify(cleanupSupportManifest),
     ], {
       stdio: "ignore", detached: true,
@@ -1110,9 +1243,9 @@ setTimeout(async()=>{
       cleanup.once("error", onError);
     });
     cleanup.unref();
-    if (launchAgentSnapshot.exists) {
+    if (executionMode === "launchagent" && serviceSnapshot.exists) {
       const currentPlist = await configSnapshot(paths.launchAgentFile);
-      if (!currentPlist.exists || currentPlist.contents !== launchAgentSnapshot.contents ||
+      if (!currentPlist.exists || currentPlist.contents !== serviceSnapshot.contents ||
           !ownedLaunchAgentExecutable(currentPlist.contents, paths)) {
         throw new Error("The managed DeepSeek LaunchAgent changed before cleanup could be scheduled.");
       }
@@ -1133,12 +1266,8 @@ setTimeout(async()=>{
 }
 
 async function waitUntilReady(runtime) {
-  const url = `http://127.0.0.1:${runtime.port}/${runtime.routeToken}/healthz`;
   for (let attempt = 0; attempt < 80; attempt++) {
-    try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(500) });
-      if (response.ok) return;
-    } catch {}
+    if (await runtimeHealth(runtime, 500)) return;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   }
   throw new Error("DeepSeek loopback router did not become ready.");
@@ -1222,7 +1351,7 @@ async function restoreRemovedConfig(snapshot, removedContents, removeWhenEmpty) 
 }
 
 async function restoreLaunchAgent(paths, launchAgentSnapshot, recovery = {}) {
-  if (process.platform !== "darwin" || directRuntimeMode(paths)) return;
+  if (runtimePlatform(paths) !== "darwin" || directRuntimeMode(paths)) return;
   const originalExecutable = launchAgentSnapshot.exists ? ownedLaunchAgentExecutable(launchAgentSnapshot.contents, paths) : null;
   if (launchAgentSnapshot.exists && !originalExecutable) return;
   const currentSnapshot = await fileSnapshot(paths.launchAgentFile);
@@ -1251,7 +1380,7 @@ async function restoreLaunchAgent(paths, launchAgentSnapshot, recovery = {}) {
     try { recoveredRuntime = JSON.parse(recoveredRuntimeSnapshot.contents); }
     catch (error) { throw new Error("The recovered DeepSeek runtime state is invalid.", { cause: error }); }
     await waitUntilReady(recoveredRuntime);
-    await scheduleLaunchAgentCleanup(
+    await scheduleRuntimeCleanup(
       paths,
       recoveredRuntime,
       recoveredRuntimeSnapshot,
@@ -1277,13 +1406,38 @@ async function restoreLaunchAgent(paths, launchAgentSnapshot, recovery = {}) {
   }
 }
 
+async function restoreRuntimeService(paths, serviceSnapshot, recovery = {}) {
+  const mode = runtimeExecutionMode(paths);
+  if (mode === "launchagent") {
+    await restoreLaunchAgent(paths, serviceSnapshot, recovery);
+    return;
+  }
+  if (mode !== "detached" || !recovery.priorServiceExists) return;
+  const restoredRuntimeText = await readOptional(paths.runtimeFile);
+  let restoredRuntime;
+  try { restoredRuntime = JSON.parse(restoredRuntimeText); }
+  catch (error) { throw new Error("The restored DeepSeek detached runtime state is invalid.", { cause: error }); }
+  if (await runtimeHealth(restoredRuntime)) return;
+  const executable = recovery.priorExecutable || restoredRuntime.nodeExecutable;
+  if (typeof executable !== "string" || !executable) throw new Error("The restored DeepSeek detached runtime executable is invalid.");
+  const child = await spawnDetachedRuntime(executable, paths);
+  restoredRuntime.pid = child.pid;
+  const snapshot = await fileSnapshot(paths.runtimeFile);
+  await atomicWrite(paths.runtimeFile, `${JSON.stringify(restoredRuntime, null, 2)}\n`, snapshot.mode, snapshot);
+  try { await waitUntilReady(restoredRuntime); }
+  catch (error) {
+    try { child.kill("SIGTERM"); } catch {}
+    throw error;
+  }
+}
+
 async function installRuntimeRouterUnlocked({ paths, routerSourceFile, nodeExecutable, selectedModel, deepseekBaseUrl, parentBaseUrl }) {
   const currentConfig = await configSnapshot(paths.codexConfig);
   const runtimeSnapshots = await Promise.all([
     fileSnapshot(paths.routerFile), fileSnapshot(paths.runtimeFile), fileSnapshot(paths.launchAgentFile),
   ]);
   const currentRuntimeText = await readOptional(paths.runtimeFile);
-  const launchAgentRecovery = { priorServiceExists: false, priorExecutable: "" };
+  const launchAgentRecovery = { priorServiceExists: false, priorExecutable: "", priorRuntime: null, startedChild: null };
   let existingRuntime = null;
   try { existingRuntime = currentRuntimeText ? JSON.parse(currentRuntimeText) : null; } catch {}
   const reusableEndpoint = Number.isInteger(existingRuntime?.port) && existingRuntime.port >= 1024 && existingRuntime.port <= 65535 &&
@@ -1292,6 +1446,9 @@ async function installRuntimeRouterUnlocked({ paths, routerSourceFile, nodeExecu
     schemaVersion: 2,
     routeToken: reusableEndpoint ? existingRuntime.routeToken : randomBytes(24).toString("hex"),
     port: reusableEndpoint ? existingRuntime.port : await availablePort(),
+    instanceId: randomBytes(24).toString("hex"),
+    shutdownToken: randomBytes(24).toString("hex"),
+    executionMode: runtimeExecutionMode(paths),
     settingsFile: paths.settingsFile,
     catalogFile: paths.catalogFile,
     selectedModel,
@@ -1314,15 +1471,13 @@ async function installRuntimeRouterUnlocked({ paths, routerSourceFile, nodeExecu
     await waitUntilReady(runtime);
     await commitConfig(currentConfig, routedConfig.contents);
   } catch (error) {
-    if (directRuntimeMode(paths) && Number.isInteger(runtime.pid)) {
-      try { process.kill(runtime.pid, "SIGTERM"); } catch {}
-    }
+    try { launchAgentRecovery.startedChild?.kill("SIGTERM"); } catch {}
     await restoreFiles(runtimeSnapshots.slice(0, 2)).then(
-      () => restoreLaunchAgent(paths, runtimeSnapshots[2], launchAgentRecovery),
+      () => restoreRuntimeService(paths, runtimeSnapshots[2], launchAgentRecovery),
       (rollbackError) => { throw new AggregateError([error, rollbackError], "Provider router failed and runtime rollback was incomplete."); },
     ).catch((rollbackError) => {
       if (rollbackError instanceof AggregateError) throw rollbackError;
-      throw new AggregateError([error, rollbackError], "Provider router failed and LaunchAgent rollback was incomplete.");
+      throw new AggregateError([error, rollbackError], "Provider router failed and service rollback was incomplete.");
     });
     throw error;
   }
@@ -1345,12 +1500,12 @@ function configuredParentBaseUrl(contents) {
 }
 
 async function runtimeProcessReady(paths, runtime) {
-  if (directRuntimeMode(paths)) {
+  const mode = runtimeExecutionMode(paths);
+  if (mode === "direct-test" || mode === "detached") {
     if (!Number.isInteger(runtime.pid)) return false;
-    try { process.kill(runtime.pid, 0); return true; }
-    catch { return false; }
+    return processIsAlive(runtime.pid) && Boolean(await runtimeHealth(runtime));
   }
-  if (process.platform !== "darwin") return false;
+  if (mode !== "launchagent") return false;
   try {
     const plist = await readFile(paths.launchAgentFile, "utf8");
     if (ownedLaunchAgentExecutable(plist, paths) !== process.execPath || runtime.nodeExecutable !== process.execPath) return false;
@@ -1364,7 +1519,7 @@ export async function runtimeRouterStatus(paths, expectedModel = "", expectedDee
     const runtime = JSON.parse(await readFile(paths.runtimeFile, "utf8"));
     if (!expectedModel || runtime.schemaVersion !== 2 || runtime.selectedModel !== expectedModel || runtime.settingsFile !== paths.settingsFile ||
       runtime.catalogFile !== paths.catalogFile ||
-      !Number.isInteger(runtime.port) || runtime.port < 1024 || runtime.port > 65535 || !/^[a-f0-9]{48}$/.test(runtime.routeToken || "")) return false;
+      runtime.executionMode !== runtimeExecutionMode(paths) || !runtimeIdentityValid(runtime)) return false;
     const config = await readFile(paths.codexConfig, "utf8");
     const baseUrl = `http://127.0.0.1:${runtime.port}/${runtime.routeToken}/v1`;
     if (!routerConfigActive(config, baseUrl)) return false;
@@ -1374,8 +1529,7 @@ export async function runtimeRouterStatus(paths, expectedModel = "", expectedDee
       : configuredParentBaseUrl(config);
     if (runtime.deepseekBaseUrl !== deepseekBaseUrl || runtime.parentBaseUrl !== parentBaseUrl) return false;
     if (!await runtimeProcessReady(paths, runtime)) return false;
-    const response = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/healthz`, { signal: AbortSignal.timeout(800) });
-    return response.ok;
+    return Boolean(await runtimeHealth(runtime));
   } catch { return false; }
 }
 
@@ -1400,7 +1554,10 @@ export async function runtimeCleanupStatus(paths, now = Date.now()) {
   }
 }
 
-async function removeRuntimeRouterUnlocked(paths, { cleanupExecutable = process.execPath, deferMacCleanup = true, cleanupSupportSnapshots = [] } = {}) {
+async function removeRuntimeRouterUnlocked(paths, options = {}) {
+  const cleanupExecutable = options.cleanupExecutable || process.execPath;
+  const deferCleanup = options.deferCleanup ?? options.deferMacCleanup ?? true;
+  const cleanupSupportSnapshots = options.cleanupSupportSnapshots || [];
   const currentConfig = await configSnapshot(paths.codexConfig);
   const state = currentConfig.exists ? managedRoutingState(currentConfig.contents) : { present: false, originalConfigExisted: false };
   const restored = currentConfig.exists ? removeRouterConfig(currentConfig.contents) : "";
@@ -1428,25 +1585,30 @@ async function removeRuntimeRouterUnlocked(paths, { cleanupExecutable = process.
   const runtimeText = runtimeSnapshots[1].contents;
   let runtime = null;
   try { runtime = runtimeText ? JSON.parse(runtimeText) : null; } catch {}
-  const ownership = process.platform === "darwin" && !directRuntimeMode(paths)
+  const executionMode = runtimeExecutionMode(paths);
+  const ownership = executionMode === "launchagent"
     ? await assertLaunchAgentOwnership(paths, runtimeSnapshots[2], runtime)
     : { executable: process.execPath, service: null };
-  const deferredMacCleanup = deferMacCleanup && process.platform === "darwin" && !directRuntimeMode(paths) &&
-    ownership.service?.exists && runtime && Number.isInteger(runtime.port) && typeof runtime.routeToken === "string";
+  const detachedServiceExists = executionMode === "detached" && Boolean(await runtimeHealth(runtime));
+  const serviceExists = executionMode === "launchagent" ? ownership.service?.exists === true : detachedServiceExists;
+  const deferredCleanup = deferCleanup && ["launchagent", "detached"].includes(executionMode) &&
+    serviceExists && runtimeIdentityValid(runtime);
   const removeWhenEmpty = !state.originalConfigExisted;
   const recovery = {
-    priorServiceExists: ownership.service?.exists === true,
-    priorExecutable: ownership.executable,
+    priorServiceExists: serviceExists,
+    priorExecutable: executionMode === "detached" ? runtime?.nodeExecutable || process.execPath : ownership.executable,
+    priorRuntime: runtime,
+    startedChild: null,
   };
-  if (deferredMacCleanup) {
-    await scheduleLaunchAgentCleanup(
-      paths, runtime, runtimeSnapshots[1], runtimeSnapshots[2], ownership.executable, cleanupExecutable, cleanupSupportSnapshots,
+  if (deferredCleanup) {
+    await scheduleRuntimeCleanup(
+      paths, runtime, runtimeSnapshots[1], runtimeSnapshots[2], recovery.priorExecutable, cleanupExecutable, cleanupSupportSnapshots,
     );
     try {
       if (currentConfig.exists && state.present) await commitConfig(currentConfig, restored, { removeWhenEmpty });
     } catch (error) {
       await restoreFiles(runtimeSnapshots.slice(0, 2)).then(
-        () => restoreLaunchAgent(paths, runtimeSnapshots[2], recovery),
+        () => restoreRuntimeService(paths, runtimeSnapshots[2], recovery),
       ).catch((rollbackError) => {
         throw new AggregateError([error, rollbackError], "Provider removal failed and runtime rollback was incomplete.");
       });
@@ -1464,9 +1626,11 @@ async function removeRuntimeRouterUnlocked(paths, { cleanupExecutable = process.
       configCommitted = true;
     }
     removalStarted = true;
-    if (process.platform === "darwin" && !directRuntimeMode(paths)) {
+    if (executionMode === "launchagent") {
       if (ownership.service?.exists) await stopOwnedLaunchAgent(paths, ownership.executable);
       if (runtimeSnapshots[2].exists) await rm(paths.launchAgentFile);
+    } else if (executionMode === "detached" && detachedServiceExists) {
+      await stopDetachedRuntime(runtime);
     }
     for (const snapshot of cleanupSupportSnapshots) quarantinedSupport.push(await quarantineRuntimeSnapshot(snapshot, "remove"));
     await rm(paths.runtimeFile, { force: true });
@@ -1476,7 +1640,7 @@ async function removeRuntimeRouterUnlocked(paths, { cleanupExecutable = process.
       throw new Error("Injected DeepSeek router runtime removal failure for testing.");
     }
     await rm(paths.routerFile, { force: true });
-    if (directRuntimeMode(paths) && Number.isInteger(runtime?.pid)) {
+    if (executionMode === "direct-test" && Number.isInteger(runtime?.pid)) {
       try { process.kill(runtime.pid, "SIGTERM"); } catch {}
     }
     for (const entry of quarantinedSupport) if (entry) await rm(entry.quarantine);
@@ -1485,7 +1649,7 @@ async function removeRuntimeRouterUnlocked(paths, { cleanupExecutable = process.
     try {
       await restoreRuntimeQuarantines(quarantinedSupport);
       await restoreFiles(runtimeSnapshots.slice(0, 2));
-      await restoreLaunchAgent(paths, runtimeSnapshots[2], recovery);
+      await restoreRuntimeService(paths, runtimeSnapshots[2], recovery);
       if (configCommitted) await restoreRemovedConfig(currentConfig, restored, removeWhenEmpty);
     } catch (rollbackError) {
       throw new AggregateError([error, rollbackError], "Provider removal failed and runtime rollback was incomplete.");
@@ -1500,20 +1664,72 @@ export async function removeRuntimeRouter(paths, options = {}) {
 
 export function runtimePaths(settingsDir, codexHome) {
   const settingsFile = join(settingsDir, "settings.json");
+  const platform = runtimePlatform({ settingsFile });
   const allowTestPath = process.env.NODE_ENV === "test" && process.env.DEEPSEEK_SUBAGENT_TEST_SETTINGS_FILE === settingsFile &&
     TEST_LAUNCH_AGENT_LABEL !== DEFAULT_LAUNCH_AGENT_LABEL;
   const effectiveLaunchAgentLabel = allowTestPath ? TEST_LAUNCH_AGENT_LABEL : DEFAULT_LAUNCH_AGENT_LABEL;
-  const launchAgentsDir = allowTestPath && process.env.DEEPSEEK_SUBAGENT_LAUNCH_AGENTS_DIR
-    ? process.env.DEEPSEEK_SUBAGENT_LAUNCH_AGENTS_DIR
-    : join(homedir(), "Library", "LaunchAgents");
+  const launchAgentsDir = platform === "darwin"
+    ? allowTestPath && process.env.DEEPSEEK_SUBAGENT_LAUNCH_AGENTS_DIR
+      ? process.env.DEEPSEEK_SUBAGENT_LAUNCH_AGENTS_DIR
+      : join(homedir(), "Library", "LaunchAgents")
+    : settingsDir;
   return {
     catalogFile: join(settingsDir, "native-models.json"),
     runtimeFile: join(settingsDir, "router-runtime.json"),
     routerFile: join(settingsDir, "router.mjs"),
+    runtimeModuleFile: join(settingsDir, "runtime.mjs"),
     routerLockDir: join(settingsDir, ".router.lock"),
-    launchAgentFile: join(launchAgentsDir, `${effectiveLaunchAgentLabel}.plist`),
+    launchAgentFile: platform === "darwin"
+      ? join(launchAgentsDir, `${effectiveLaunchAgentLabel}.plist`)
+      : join(launchAgentsDir, ".router-service-placeholder"),
     launchAgentLabel: effectiveLaunchAgentLabel,
     codexConfig: join(codexHome, "config.toml"),
     settingsFile,
   };
+}
+
+function runDetachedHost(routerFile, runtimeFile) {
+  if (!routerFile || !runtimeFile) throw new Error("Detached DeepSeek router host requires router and runtime files.");
+  let child = null;
+  let restartTimer = null;
+  let stopping = false;
+  let failures = 0;
+  const scheduleRestart = () => {
+    if (stopping || restartTimer) return;
+    const delay = Math.min(100 * 2 ** Math.min(failures++, 4), 1_600);
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      start();
+    }, delay);
+  };
+  const start = () => {
+    if (stopping) return;
+    child = spawn(process.execPath, [routerFile, runtimeFile], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    let failedToSpawn = false;
+    child.once("spawn", () => { failures = 0; });
+    child.once("error", () => { failedToSpawn = true; scheduleRestart(); });
+    child.once("exit", (code) => {
+      child = null;
+      if (stopping || code === 0) process.exit(0);
+      if (!failedToSpawn) scheduleRestart();
+    });
+  };
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    if (restartTimer) clearTimeout(restartTimer);
+    try { child?.kill("SIGTERM"); } catch {}
+    const forcedExit = setTimeout(() => process.exit(0), 1_000);
+    forcedExit.unref();
+    if (!child) process.exit(0);
+  };
+  for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, stop);
+  start();
+}
+
+if (process.argv[2] === "--deepseek-detached-host") {
+  runDetachedHost(process.argv[3], process.argv[4]);
 }

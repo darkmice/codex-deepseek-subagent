@@ -1,6 +1,6 @@
 {
   "name": "deepseek-subagent",
-  "version": "0.5.0+codex.20260915101428",
+  "version": "0.5.0+codex.20260915113133",
   "description": "Route selected DeepSeek models through native Codex child tasks with live output.",
   "author": {
     "name": "dark"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "DeepSeek Subagent",
     "shortDescription": "Delegate work to a native DeepSeek child task.",
-    "longDescription": "Uses a user-scoped macOS loopback router so native spawn_agent child tasks can run the selected DeepSeek Responses model with live Codex output while parent requests continue to the upstream resolved from their active ChatGPT-authenticated provider. Configure the API key and model in Settings \u2192 Integrations, then start a new task.",
+    "longDescription": "Uses a user-scoped macOS, Windows, or Linux loopback router so native spawn_agent child tasks can run the selected DeepSeek Responses model with live Codex output while parent requests continue to the upstream resolved from their active ChatGPT-authenticated provider. Configure the API key and model in Settings \u2192 Integrations, then start a new task.",
     "developerName": "dark",
     "category": "Developer Tools",
     "capabilities": [

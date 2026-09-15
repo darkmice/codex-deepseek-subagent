@@ -11,7 +11,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: 20
       - run: npm run test:all
-      - run: find plugins scripts tests -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - run: npm run check:syntax
       - run: git diff --check
       - run: npm run package
       - run: npm run verify:package

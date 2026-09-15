@@ -110,8 +110,12 @@ try {
   const productionProbeResult = JSON.parse(productionPathsText);
   const productionPaths = productionProbeResult.paths;
   assert(!productionPaths.launchAgentFile.includes("evil-launchagents"), "Production runtime honored the test LaunchAgent path override.");
-  assert(productionPaths.launchAgentFile.endsWith("com.dark.deepseek-subagent-router.plist"), "Production runtime honored the test LaunchAgent label override.");
-  assert.equal(productionProbeResult.mode, process.platform === "darwin" ? "launchagent" : "unsupported", "Production runtime honored direct test mode.");
+  if (process.platform === "darwin") {
+    assert(productionPaths.launchAgentFile.endsWith("com.dark.deepseek-subagent-router.plist"), "Production runtime honored the test LaunchAgent label override.");
+  } else {
+    assert.equal(productionPaths.launchAgentFile, join(settingsDir, ".router-service-placeholder"));
+  }
+  assert.equal(productionProbeResult.mode, process.platform === "darwin" ? "launchagent" : "detached", "Production runtime honored direct test mode.");
 
   process.env.CODEX_HOME = codexHome;
   await writeFile(paths.codexConfig, originalConfig);
@@ -240,7 +244,7 @@ try {
   const deadHolder = spawnLockHolder();
   await waitForLockHolder(deadHolder);
   const deadHolderExit = new Promise((resolveExit) => deadHolder.once("exit", resolveExit));
-  deadHolder.kill("SIGKILL");
+  deadHolder.kill(process.platform === "win32" ? "SIGTERM" : "SIGKILL");
   await deadHolderExit;
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 120));
   await withNativeMutationLock(settingsDir, async () => {

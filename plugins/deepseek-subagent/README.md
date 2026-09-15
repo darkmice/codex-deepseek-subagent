@@ -14,12 +14,14 @@ DeepSeek Subagent 将 DeepSeek 接入 Codex 原生 `spawn_agent` runtime。child
 ## Setup / 设置
 
 1. Open **Settings → Integrations → DeepSeek Subagent**.
-2. On macOS, use the Codex binary bundled with the current desktop app (or a
-   matching current CLI release), ensure Codex Multi-Agent v2 is enabled (see below), save
+2. On macOS, Windows, or Linux, use the Codex binary bundled with the current
+   desktop app (or a matching current CLI release), ensure Codex Multi-Agent v2 is enabled (see below), save
    the API key, refresh the model list, and save the default model. The list
    combines DeepSeek `/v1/models` with the multimodal `deepseek-flash` model.
-   Saving a model verifies it with a minimal Responses request, starts a user
-   LaunchAgent, and installs a marked loopback provider route.
+   Saving a model verifies it with a minimal Responses request, starts a
+   user-scoped router, and installs a marked loopback provider route. macOS
+   uses LaunchAgent; Windows and Linux use an authenticated detached process
+   without administrator privileges.
 3. Start a new Codex task so the generated native agent role is loaded.
 
 Before saving a model, add this table to `~/.codex/config.toml`:
@@ -112,13 +114,14 @@ API key.
 
 The generated catalog and router state live beside that file. The
 plugin-managed role is `~/.codex/agents/deepseek-subagent.toml` (or the active
-`CODEX_HOME`). Router state is stored beside the settings file, and its macOS
-LaunchAgent is user-scoped. Deleting the key immediately disables DeepSeek,
+`CODEX_HOME`). Router state is stored beside the settings file. Its macOS
+LaunchAgent and its Windows/Linux detached process are user-scoped. Deleting the key immediately disables DeepSeek,
 restores the previous provider assignment for new tasks, and retains parent
 pass-through for already-open routed tasks for up to ten minutes before cleanup.
 Only plugin-managed files are removed; an unmanaged role at the same path is
-never overwritten or deleted. The same fail-closed ownership check applies to
-the fixed LaunchAgent path and registered service label.
+never overwritten or deleted. On macOS, the same fail-closed ownership check
+applies to the fixed LaunchAgent path and registered service label. On Windows
+and Linux, replacement and shutdown require the matching random local runtime identity.
 
 完整 API key 不会进入仓库、分发包、命令参数、日志或工具返回；它会作为认证信息发送
 给所配置的 DeepSeek API。删除 key 会立即禁用 DeepSeek、为新任务恢复此前 provider，
@@ -131,8 +134,9 @@ the fixed LaunchAgent path and registered service label.
 
 The router binds only to `127.0.0.1` behind a random capability path. It never
 logs request bodies or authorization headers. ChatGPT authorization is never
-forwarded to DeepSeek. Native routing is currently unavailable on Windows and
-Linux; connection and model discovery remain available there.
+forwarded to DeepSeek. Native routing is supported on macOS, Windows, and Linux.
+The Windows/Linux detached router is recovered automatically on the next
+delegation if its process exits unexpectedly.
 
 A delegated DeepSeek provider payload can include the explicit task message,
 model context assembled for the child, tool definitions and results, and any
@@ -144,8 +148,8 @@ its arguments. The router's in-memory-only guarantee does not make delegation
 messages secret from Codex or DeepSeek.
 
 路由只监听 `127.0.0.1`，并使用随机 capability 路径；不记录请求正文或认证头，也绝不
-把 ChatGPT 授权转发给 DeepSeek。Windows 与 Linux 目前只能使用连接与模型发现，尚不
-支持此原生路由。
+把 ChatGPT 授权转发给 DeepSeek。原生路由支持 macOS、Windows 与 Linux；若
+Windows/Linux 后台 router 意外退出，下一次委派会自动恢复它。
 
 发往 DeepSeek 的委派 payload 可能包含明确任务消息、为 child 组装的模型上下文、工具
 定义与结果，以及该 child 请求携带的附件；使用 `fork_turns: "none"` 时不会复制完整
@@ -181,17 +185,32 @@ Codex 原生协作工具执行委派；跨 provider 不复制历史。当前加�
 Before uninstalling, use **Delete key** in Settings or run the independent
 cleanup copy installed beside `settings.json`:
 
+macOS:
+
 ```sh
 node "$HOME/Library/Application Support/DeepSeek Subagent/cleanup.mjs"
 ```
 
+Linux:
+
+```sh
+node "${XDG_CONFIG_HOME:-$HOME/.config}/deepseek-subagent/cleanup.mjs"
+```
+
+Windows PowerShell:
+
+```powershell
+node "$env:APPDATA\DeepSeek Subagent\cleanup.mjs"
+```
+
 The command remains available after plugin source removal. It immediately
-stops the owned LaunchAgent, restores the previous provider, and removes the
+stops the owned router service/process, restores the previous provider, and removes the
 credential plus all verified plugin-managed native files. Start a new Codex
 task before uninstalling. Conflicting files with unverifiable ownership are
 left untouched and cause cleanup to fail closed.
 
 卸载前请在设置页点击**删除 Key**，或执行上面的独立清理命令。该脚本与
-`settings.json` 同目录安装，即使插件源码已删除仍可运行；它会立即停止插件所有的
-LaunchAgent、恢复原 provider，并删除凭据及所有可验证的受管原生文件。随后新建 Codex
-任务再卸载。无法验证所有权的冲突文件会保留，清理会 fail closed。
+`settings.json` 同目录安装，即使插件源码已删除仍可运行；请按当前系统使用上方对应
+命令。它会立即停止插件所有的 router 服务或进程、恢复原 provider，并删除凭据及所有
+可验证的受管原生文件。随后新建 Codex 任务再卸载。无法验证所有权的冲突文件会保留，
+清理会 fail closed。

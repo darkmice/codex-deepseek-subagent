@@ -14,7 +14,7 @@ import {
 } from "./native-config.mjs";
 
 const SERVER_NAME = "deepseek-settings";
-const SERVER_VERSION = "0.5.0+codex.20260915101428";
+const SERVER_VERSION = "0.5.0+codex.20260915113133";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = dirname(SCRIPT_DIR);
 const MODEL_TEMPLATE = join(PLUGIN_DIR, "assets", "model-template.json");
@@ -225,7 +225,7 @@ function classifiedError(error) {
     [/multi_agent_v2/i, "MULTI_AGENT_DISABLED"],
     [/(?:current|restored parent) provider.*not (?:a )?ChatGPT-authenticated|not a ChatGPT-authenticated provider/i, "PROVIDER_NOT_AUTHENTICATED"],
     [/current Codex provider.*(?:unsupported|does not use the Responses wire API)|profile provider overrides/i, "PROVIDER_UNSUPPORTED"],
-    [/requires macOS LaunchAgents|locking is supported only on macOS and Linux/i, "NATIVE_PLATFORM_UNSUPPORTED"],
+    [/routing is unavailable on this platform|runtime locking is unavailable on this platform/i, "NATIVE_PLATFORM_UNSUPPORTED"],
     [/unmanaged|unverified|unrecognized|ownership changed|non-regular|multiply linked/i, "OWNERSHIP_CONFLICT"],
     [/Codex config|provider routing|LaunchAgent|native role|Model save failed/i, "NATIVE_INTEGRATION_FAILED"],
   ];
@@ -402,6 +402,23 @@ async function ensureNative(settings, models = []) {
   return nativeIntegrationStatus(SETTINGS_DIR, settings.model, apiBaseUrl().toString());
 }
 
+async function recoverConfiguredNative() {
+  const observed = await readSettings();
+  if (!validApiKey(observed.apiKey) || !observed.model) return { ready: false, skipped: true };
+  const existing = await nativeIntegrationStatus(SETTINGS_DIR, observed.model, apiBaseUrl().toString());
+  if (existing.ready) return existing;
+  return queueSettingsMutation(async () => {
+    const current = await readSettings();
+    if (current.revision !== observed.revision || current.model !== observed.model || current.apiKey !== observed.apiKey) {
+      return { ready: false, skipped: true };
+    }
+    const latest = await nativeIntegrationStatus(SETTINGS_DIR, current.model, apiBaseUrl().toString());
+    if (latest.ready) return latest;
+    await ensureNative(current);
+    return nativeIntegrationStatus(SETTINGS_DIR, current.model, apiBaseUrl().toString());
+  });
+}
+
 async function settingsSnapshot(message, source = null) {
   const settings = source || await readSettings();
   const configured = validApiKey(settings.apiKey);
@@ -507,8 +524,18 @@ async function prepareNativeDelegation(args) {
   if (!validApiKey(settings.apiKey) || !settings.model) {
     throw new Error("DeepSeek native delegation is not configured. Save an API key and model first.");
   }
-  const native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, apiBaseUrl().toString());
-  if (!native.ready) throw new Error("DeepSeek native integration is not ready. Save the selected model again, then start a new Codex task.");
+  let native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, apiBaseUrl().toString());
+  if (!native.ready) {
+    native = await queueSettingsMutation(async () => {
+      const current = await readSettings();
+      if (current.revision !== settings.revision || current.model !== settings.model || current.apiKey !== settings.apiKey) {
+        throw new Error("DeepSeek settings changed while the native router was being recovered. Retry the delegation.");
+      }
+      await ensureNative(current);
+      return nativeIntegrationStatus(SETTINGS_DIR, current.model, apiBaseUrl().toString());
+    });
+  }
+  if (!native.ready) throw new Error("DeepSeek native integration could not be recovered. Save the selected model again, then start a new Codex task.");
   const runtimeFile = nativePaths(SETTINGS_DIR).runtimeFile;
   const info = await lstat(runtimeFile);
   if (info.isSymbolicLink() || !info.isFile() || info.nlink !== 1) {
@@ -519,7 +546,8 @@ async function prepareNativeDelegation(args) {
   catch { throw new Error("DeepSeek router runtime state is invalid."); }
   if (runtime?.schemaVersion !== 2 || runtime.selectedModel !== settings.model ||
       !Number.isInteger(runtime.port) || runtime.port < 1024 || runtime.port > 65535 ||
-      !/^[a-f0-9]{48}$/.test(runtime.routeToken || "")) {
+      !/^[a-f0-9]{48}$/.test(runtime.routeToken || "") || !/^[a-f0-9]{48}$/.test(runtime.instanceId || "") ||
+      !/^[a-f0-9]{48}$/.test(runtime.shutdownToken || "")) {
     throw new Error("DeepSeek router runtime state does not match the saved model.");
   }
   let response;
@@ -611,6 +639,7 @@ async function handle(message) {
   try {
     if (message.method === "initialize") {
       await reconcileAndScheduleCleanup();
+      await recoverConfiguredNative();
       send({
         jsonrpc: "2.0", id: message.id,
         result: {

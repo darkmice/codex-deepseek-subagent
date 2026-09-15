@@ -42,7 +42,7 @@ await withNativeMutationLock(settingsDir, async () => {
   const scriptStates = await Promise.all(managedScripts.map((path) => validateOwnedRegularFile(path, { managedScript: true })));
   if (scriptStates.some((exists) => !exists)) throw new Error("DeepSeek cleanup support files are incomplete; refusing partial cleanup.");
   await validateLegacyCredentialHelper(settingsDir);
-  await removeNativeIntegration(settingsDir, { deferMacCleanup: false, keepCleanupSupport: true });
+  await removeNativeIntegration(settingsDir, { deferCleanup: false, keepCleanupSupport: true });
   if (settingsExists) await rm(settingsFile);
   if (routerLockExists) await rm(lockFile);
   await removeNativeCleanupSupport(settingsDir);

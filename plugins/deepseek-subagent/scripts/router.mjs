@@ -8,12 +8,18 @@ import { brotliDecompress, gunzip, inflate } from "node:zlib";
 const runtimeFile = process.argv[2];
 if (!runtimeFile) throw new Error("DeepSeek router runtime file is required.");
 
-const requiredRuntimeFields = ["routeToken", "port", "settingsFile", "catalogFile", "selectedModel", "deepseekBaseUrl", "parentBaseUrl"];
+const requiredRuntimeFields = [
+  "routeToken", "instanceId", "shutdownToken", "executionMode", "port", "settingsFile", "catalogFile",
+  "selectedModel", "deepseekBaseUrl", "parentBaseUrl",
+];
 function validateRuntime(runtime) {
   if (runtime?.schemaVersion !== 2 || requiredRuntimeFields.some((field) => !runtime[field])) {
     throw new Error("DeepSeek router runtime file is invalid.");
   }
-  if (!Number.isInteger(runtime.port) || runtime.port < 1024 || runtime.port > 65535 || !/^[a-f0-9]{48}$/.test(runtime.routeToken)) {
+  if (!Number.isInteger(runtime.port) || runtime.port < 1024 || runtime.port > 65535 ||
+      !/^[a-f0-9]{48}$/.test(runtime.routeToken) || !/^[a-f0-9]{48}$/.test(runtime.instanceId) ||
+      !/^[a-f0-9]{48}$/.test(runtime.shutdownToken) ||
+      !["launchagent", "detached", "direct-test"].includes(runtime.executionMode)) {
     throw new Error("DeepSeek router endpoint configuration is invalid.");
   }
   if (!/^deepseek-[A-Za-z0-9][A-Za-z0-9._:/-]{0,118}$/.test(runtime.selectedModel)) throw new Error("DeepSeek router model is invalid.");
@@ -945,7 +951,35 @@ const server = createServer(async (request, response) => {
   try {
     if (request.method === "GET" && request.url === `/${initialRuntime.routeToken}/healthz`) {
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      response.end(JSON.stringify({ status: "ok", ...counters }));
+      response.end(JSON.stringify({ status: "ok", instanceId: initialRuntime.instanceId, routerPid: process.pid, ...counters }));
+      return;
+    }
+    if (process.env.NODE_ENV === "test" && request.method === "POST" &&
+        request.url === `/${initialRuntime.routeToken}/control/test-crash` &&
+        request.headers.authorization === `Bearer ${initialRuntime.shutdownToken}`) {
+      request.resume();
+      response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store", connection: "close" });
+      response.end(JSON.stringify({ status: "crashing", instanceId: initialRuntime.instanceId }));
+      setTimeout(() => process.exit(86), 10).unref();
+      return;
+    }
+    if (request.method === "POST" && request.url === `/${initialRuntime.routeToken}/control/shutdown`) {
+      if (request.headers.authorization !== `Bearer ${initialRuntime.shutdownToken}` || request.headers["content-encoding"] ||
+          ![undefined, "0"].includes(request.headers["content-length"])) {
+        request.resume();
+        response.writeHead(403, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify({ error: { code: "SHUTDOWN_FORBIDDEN", message: "Managed router shutdown was not authorized." } }));
+        return;
+      }
+      request.resume();
+      response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store", connection: "close" });
+      response.end(JSON.stringify({ status: "stopping", instanceId: initialRuntime.instanceId }));
+      setTimeout(() => {
+        server.closeAllConnections?.();
+        server.close(() => process.exit(0));
+        const forcedExit = setTimeout(() => process.exit(0), 1_000);
+        forcedExit.unref();
+      }, 10).unref();
       return;
     }
     const requestUrl = new URL(request.url, "http://127.0.0.1");

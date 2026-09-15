@@ -13,6 +13,8 @@ const settingsFile = join(temp, "settings.json");
 const catalogFile = join(temp, "native-models.json");
 const runtimeFile = join(temp, "runtime.json");
 const routeToken = "a".repeat(48);
+const instanceId = "b".repeat(48);
+const shutdownToken = "c".repeat(48);
 const requests = [];
 const heldResponses = [];
 let declaredOversizeClosed = false;
@@ -199,6 +201,9 @@ await writeFile(catalogFile, `${JSON.stringify(validCatalog)}\n`);
 await writeFile(runtimeFile, `${JSON.stringify({
   schemaVersion: 2,
   routeToken,
+  instanceId,
+  shutdownToken,
+  executionMode: "direct-test",
   port: routerPort,
   settingsFile,
   catalogFile,
