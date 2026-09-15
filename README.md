@@ -2,7 +2,40 @@
 
 This repository is a portable Codex team marketplace. 中文说明见各段下方。
 
-## Install / 安装
+## Install with Codex / 让 Codex 安装
+
+Paste the following request into Codex. Codex should preserve existing user
+configuration and must never ask you to paste the DeepSeek API key into chat or
+a shell command. / 将下面这段话直接发给 Codex。Codex 应保留已有用户配置，且不得要求
+你把 DeepSeek API Key 粘贴到聊天或 shell 命令中。
+
+```text
+请从公开仓库 darkmice/codex-deepseek-subagent 安装 DeepSeek Subagent 插件：
+
+1. 使用当前 ChatGPT 桌面版自带的 Codex CLI，或兼容当前插件协议的新版 Codex CLI。
+2. 先运行 `codex plugin marketplace list`。如果尚未添加该仓库，运行
+   `codex plugin marketplace add darkmice/codex-deepseek-subagent --ref main`；
+   如果 `deepseek-team` 已存在，则运行
+   `codex plugin marketplace upgrade deepseek-team`。
+3. 运行 `codex plugin add deepseek-subagent@deepseek-team`。
+4. 在 macOS 上检查 `~/.codex/config.toml`，仅在缺失时加入
+   `[features.multi_agent_v2]` 和 `enabled = true`，保留其他现有配置。
+5. 不要向我索取或代填 DeepSeek API Key。安装完成后，让我亲自在
+   Settings → Integrations → DeepSeek Subagent 中填写 Key、刷新模型并保存模型。
+6. 提醒我保存模型后新建一个 Codex 任务，再用原生 DeepSeek 子智能体做一次测试；
+   正常委派不应打开 Settings 页面。
+7. 如果当前系统不是 macOS，明确说明设置、连接测试和模型发现仍可使用，
+   但原生 DeepSeek 子智能体路由目前不可用。
+```
+
+Direct Git marketplace commands / 直接使用 Git marketplace 的命令：
+
+```sh
+codex plugin marketplace add darkmice/codex-deepseek-subagent --ref main
+codex plugin add deepseek-subagent@deepseek-team
+```
+
+## Manual install / 手动安装
 
 1. Install Node.js 20+ and use the Codex binary bundled with the current
    desktop app, or a matching current CLI release. Older CLI builds may not
