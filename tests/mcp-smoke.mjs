@@ -224,7 +224,7 @@ try {
   const beforeInjectedRemoval = new Map(await Promise.all(rollbackPaths.map(async (path) => [path, await readFile(path, "utf8")])));
   result = (await rpc("tools/call", { name: "deepseek_credential_delete", arguments: { expectedRevision: 2 } })).result;
   assert.equal(result.isError, true);
-  assert.equal(result._meta.deepseekSubagentError.code, "ROUTER_UNAVAILABLE");
+  assert.equal(result._meta.deepseekSubagentError.code, "ROUTER_UNAVAILABLE", result.content[0].text);
   for (const path of rollbackPaths) {
     assert.equal(await readFile(path, "utf8"), beforeInjectedRemoval.get(path), `Runtime removal failure did not restore ${path}.`);
   }
