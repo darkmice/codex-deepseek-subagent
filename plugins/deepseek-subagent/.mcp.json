@@ -1,0 +1,49 @@
+{
+  "mcpServers": {
+    "deepseek_settings": {
+      "command": "node",
+      "args": [
+        "./scripts/server.mjs"
+      ],
+      "cwd": ".",
+      "enabled": true,
+      "env_vars": [
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "XDG_CONFIG_HOME",
+        "PATH",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "CODEX_HOME"
+      ],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 120,
+      "default_tools_approval_mode": "approve",
+      "tools": {
+        "deepseek_settings": {
+          "approval_mode": "approve"
+        },
+        "deepseek_delegation_prepare": {
+          "approval_mode": "approve"
+        },
+        "deepseek_settings_save": {
+          "approval_mode": "approve"
+        },
+        "deepseek_models_list": {
+          "approval_mode": "approve"
+        },
+        "deepseek_credential_set": {
+          "approval_mode": "approve"
+        },
+        "deepseek_credential_delete": {
+          "approval_mode": "prompt"
+        },
+        "deepseek_connection_test": {
+          "approval_mode": "approve"
+        }
+      }
+    }
+  }
+}

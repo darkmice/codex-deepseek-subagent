@@ -1,0 +1,22 @@
+{
+  "name": "codex-deepseek-subagent",
+  "version": "0.5.0+codex.20260915101428",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/mcp-smoke.mjs",
+    "test:router": "node tests/router.mjs",
+    "test:launchagent": "node tests/launchagent-lifecycle.mjs",
+    "test:runtime": "node tests/runtime-config.mjs",
+    "test:cas": "node tests/runtime-cas.mjs",
+    "test:native": "node tests/native-spawn-e2e.mjs",
+    "test:parent-live": "node tests/parent-router-live.mjs",
+    "test:all": "npm test && npm run test:router && npm run test:runtime && npm run test:cas && npm run test:launchagent",
+    "test:release": "npm run test:all && npm run test:native && npm run package && npm run verify:package",
+    "package": "node scripts/package.mjs",
+    "verify:package": "node scripts/verify-package.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
