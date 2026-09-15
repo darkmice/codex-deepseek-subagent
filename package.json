@@ -1,6 +1,6 @@
 {
   "name": "codex-deepseek-subagent",
-  "version": "0.5.0+codex.20260915113133",
+  "version": "0.5.0+codex.20260915115718",
   "private": true,
   "type": "module",
   "scripts": {

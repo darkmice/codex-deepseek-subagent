@@ -201,6 +201,8 @@ try {
   assert.equal(result.isError, undefined);
   assert((await readFile(rolePath, "utf8")).includes("# read-only-sentinel"));
   assert.deepEqual(JSON.parse(await readFile(join(temp, "native-models.json"), "utf8")).models.map((model) => model.slug), ["deepseek-mock-a", "deepseek-mock-b", "deepseek-flash"]);
+  const cleanupSupportPath = join(temp, "cleanup.mjs");
+  await writeFile(cleanupSupportPath, (await readFile(cleanupSupportPath, "utf8")).replace(/\r?\n/, "\r\n"));
   await writeFile(legacyCredentialHelper, `${LEGACY_NATIVE_CREDENTIAL_SOURCE}# unrecognized\n`, { mode: 0o600 });
   const settingsIdentityBeforeRejectedDelete = await stat(join(temp, "settings.json"));
   result = (await rpc("tools/call", { name: "deepseek_credential_delete", arguments: { expectedRevision: 2 } })).result;

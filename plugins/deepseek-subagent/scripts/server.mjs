@@ -14,7 +14,7 @@ import {
 } from "./native-config.mjs";
 
 const SERVER_NAME = "deepseek-settings";
-const SERVER_VERSION = "0.5.0+codex.20260915113133";
+const SERVER_VERSION = "0.5.0+codex.20260915115718";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = dirname(SCRIPT_DIR);
 const MODEL_TEMPLATE = join(PLUGIN_DIR, "assets", "model-template.json");

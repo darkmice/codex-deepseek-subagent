@@ -10,6 +10,7 @@ import { installRuntimeRouter, removeRuntimeRouter, runtimeCleanupStatus, runtim
 
 export const NATIVE_ROLE_NAME = "deepseek";
 const MANAGED_MARKER = "# Managed by the DeepSeek Subagent Codex plugin.\n";
+const MANAGED_SCRIPT_MARKER = /^\/\/ Managed by the DeepSeek Subagent Codex plugin\.\r?\n/;
 const ROUTER_SOURCE = fileURLToPath(new URL("./router.mjs", import.meta.url));
 const NATIVE_CONFIG_SOURCE = fileURLToPath(new URL("./native-config.mjs", import.meta.url));
 const RUNTIME_SOURCE = fileURLToPath(new URL("./runtime.mjs", import.meta.url));
@@ -121,7 +122,7 @@ async function rollbackCommittedSnapshots(beforeSnapshots, committedSnapshots) {
 }
 
 function assertManagedScriptSnapshot(snapshot) {
-  if (snapshot.exists && !snapshot.contents.startsWith("// Managed by the DeepSeek Subagent Codex plugin.\n")) {
+  if (snapshot.exists && !MANAGED_SCRIPT_MARKER.test(snapshot.contents)) {
     throw new Error(`Refusing to overwrite unmanaged cleanup support file: ${snapshot.path}`);
   }
 }

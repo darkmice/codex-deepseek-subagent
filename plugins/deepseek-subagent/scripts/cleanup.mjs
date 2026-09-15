@@ -26,7 +26,7 @@ async function validateOwnedRegularFile(path, { settings = false, managedScript 
         throw new Error(`Refusing to delete an unrecognized DeepSeek settings file: ${path}`);
       }
     }
-    if (managedScript && !(await readFile(path, "utf8")).startsWith("// Managed by the DeepSeek Subagent Codex plugin.\n")) {
+    if (managedScript && !/^\/\/ Managed by the DeepSeek Subagent Codex plugin\.\r?\n/.test(await readFile(path, "utf8"))) {
       throw new Error(`Refusing to delete an unmanaged DeepSeek cleanup support file: ${path}`);
     }
     return true;
