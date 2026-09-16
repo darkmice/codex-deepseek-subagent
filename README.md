@@ -36,6 +36,26 @@ codex plugin marketplace add darkmice/codex-deepseek-subagent --ref main
 codex plugin add deepseek-subagent@deepseek-team
 ```
 
+## DeepSeek Team workflow / DeepSeek 团队模式
+
+The plugin provides `$deepseek-team` for GPT-led execution. GPT owns planning,
+architecture, security judgment, visual decisions, integration, and final QA;
+native DeepSeek children handle suitable bounded implementation, testing,
+debugging, documentation, research, and data-processing work. The existing
+`deepseek-subagent` skill remains the lower-level contract for one explicit
+native delegation.
+
+插件提供 `$deepseek-team` 编排模式：GPT 负责规划、架构、安全判断、视觉决策、集成与
+最终 QA；原生 DeepSeek 子智能体执行适合拆分的有界实现、测试、调试、文档、研究和数据
+处理任务。现有 `deepseek-subagent` Skill 继续作为单次明确原生委派的底层契约。
+
+Team mode is selected only for matching requests; it does not make DeepSeek the
+root model or force every small task through a child. Delegated content may be
+sent to DeepSeek, and GPT must inspect the real artifacts and rerun appropriate
+verification before reporting completion. / 团队模式只在匹配的请求中使用，不会把
+DeepSeek 设为根模型，也不会强制每个小任务都创建子智能体。委派内容可能发送给
+DeepSeek；GPT 在报告完成前必须检查真实产物并重新验证。
+
 ## Manual install / 手动安装
 
 1. Install Node.js 20+ and use the Codex binary bundled with the current
@@ -69,11 +89,14 @@ codex plugin add deepseek-subagent@deepseek-team
    root-level `multi_agent_v2.hide_spawn_agent_metadata` setting if present;
    current Codex releases reject it in strict config mode.
 5. Start a Codex task, open **Settings → Integrations → DeepSeek Subagent**,
-   save the key and model, then start one new task. Saving the model installs a
+   save the Base URL, key, and model, then start one new task. The Base URL
+   defaults to DeepSeek's official `/v1/` endpoint and also accepts compatible
+   HTTPS Responses API proxies. Saving the model installs a
    user-scoped router and a marked, reversible loopback provider route. macOS
    uses LaunchAgent; Windows and Linux use an authenticated detached process
    that requires no administrator privileges. / 先按第 4 步启用 Multi-Agent v2；
-   再打开设置页保存 key 和模型。保存模型会安装用户级 router 与带标记、可恢复的
+   再打开设置页保存 Base URL、key 和模型。Base URL 默认使用 DeepSeek 官方 `/v1/`
+   地址，也支持兼容 Responses API 的 HTTPS 代理。保存模型会安装用户级 router 与带标记、可恢复的
    本机 provider 路由；macOS 使用 LaunchAgent，Windows/Linux 使用无需管理员权限的
    受认证后台进程。随后新建一个任务。
 

@@ -16,7 +16,8 @@ DeepSeek Subagent 将 DeepSeek 接入 Codex 原生 `spawn_agent` runtime。child
 1. Open **Settings → Integrations → DeepSeek Subagent**.
 2. On macOS, Windows, or Linux, use the Codex binary bundled with the current
    desktop app (or a matching current CLI release), ensure Codex Multi-Agent v2 is enabled (see below), save
-   the API key, refresh the model list, and save the default model. The list
+   the API key and Base URL, refresh the model list, and save the default model. The Base URL defaults to
+   `https://api.deepseek.com/v1/` and may point to an HTTPS Responses-compatible proxy. The list
    combines DeepSeek `/v1/models` with the multimodal `deepseek-flash` model.
    Saving a model verifies it with a minimal Responses request, starts a
    user-scoped router, and installs a marked loopback provider route. macOS
@@ -40,7 +41,8 @@ Codex releases reject it in strict config mode. The plugin checks the v2
 prerequisite. Saving a model then changes only a marked provider-routing block
 and preserves the previous provider assignment for restoration.
 
-保存 key 和默认模型前，按上面的形式启用 Multi-Agent v2；其中
+保存 Base URL、key 和默认模型前，按上面的形式启用 Multi-Agent v2。Base URL 默认是
+`https://api.deepseek.com/v1/`，也可填写兼容 Responses API 的 HTTPS 代理地址；其中
 `hide_spawn_agent_metadata = false` 仅用于显示 spawn 元数据，并不是暴露
 `agent_type` 的前置条件。若存在旧的根级配置
 `multi_agent_v2.hide_spawn_agent_metadata`，请删除它。保存后新建一个 Codex 任务。
@@ -55,6 +57,31 @@ authorization. When native `spawn_agent` uses `agent_type: "deepseek"`, the
 managed role selects the saved model; requests whose model matches that saved
 model have their authorization replaced and are sent to DeepSeek. Custom
 providers with unsupported routing/header fields fail closed.
+
+## Team orchestration / 团队编排
+
+The plugin includes two complementary skills. `deepseek-subagent` owns one
+bounded native delegation and its routing safety contract. `deepseek-team` is
+an optional orchestration workflow: GPT plans the work and keeps architecture,
+security judgment, visual decisions, integration, and final QA, while DeepSeek
+children execute suitable bounded implementation, testing, debugging,
+documentation, research, or data-processing tasks. Invoke it with
+`$deepseek-team` or ask for GPT-led DeepSeek team execution.
+
+插件包含两个互补的 Skill。`deepseek-subagent` 负责一次有界的原生委派及其路由安全
+契约；`deepseek-team` 是可选编排工作流：GPT 负责规划，并保留架构、安全判断、视觉
+决策、集成和最终 QA，DeepSeek 子智能体负责适合拆分的实现、测试、调试、文档、研究或
+数据处理。可使用 `$deepseek-team`，或明确要求“由 GPT 主持、DeepSeek 执行”。
+
+Team mode does not delegate secrets, credential handling, production writes,
+destructive actions, release approval, or final security decisions. GPT treats
+child output as untrusted until it has inspected the actual artifacts and
+rerun appropriate verification. It does not promise a fixed benchmark score or
+cost ratio.
+
+团队模式不会委派密钥处理、生产写入、破坏性操作、发布审批或最终安全判断。GPT 必须
+检查实际产物并重新验证，不能把子智能体报告直接当作完成证据，也不会承诺固定的性能或
+成本比例。
 
 Codex encrypts native collaboration message bodies for its ChatGPT provider.
 Before spawning, the skill therefore calls `deepseek_delegation_prepare` with
@@ -105,6 +132,15 @@ permissions where supported:
 - Windows: `%APPDATA%\DeepSeek Subagent\settings.json`
 - Linux: `$XDG_CONFIG_HOME/deepseek-subagent/settings.json`, or
   `~/.config/deepseek-subagent/settings.json`
+
+The Base URL is stored in the same file. It must be an absolute HTTPS URL
+without embedded credentials, query, or fragment; plain HTTP is accepted only
+for loopback testing. Changing it clears the selected model and removes the old
+native route, so refresh and save a model again before starting a new task.
+
+Base URL 与 Key 保存在同一设置文件中。它必须是不含内嵌凭据、查询参数或片段的绝对
+HTTPS URL；只有本机回环测试允许 HTTP。修改 Base URL 会清空已选模型并移除旧原生
+路由，之后必须重新刷新并保存模型，再新建任务。
 
 If Settings reports that this file is damaged, close Codex, make a private
 backup only if needed, and remove only this `settings.json`. Reopen Settings to

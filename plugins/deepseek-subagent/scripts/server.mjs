@@ -14,17 +14,22 @@ import {
 } from "./native-config.mjs";
 
 const SERVER_NAME = "deepseek-settings";
-const SERVER_VERSION = "0.5.0+codex.20260915115718";
+const SERVER_VERSION = "0.6.0+codex.20260916122412";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = dirname(SCRIPT_DIR);
 const MODEL_TEMPLATE = join(PLUGIN_DIR, "assets", "model-template.json");
 const SETTINGS_HTML = join(PLUGIN_DIR, "assets", "settings.html");
 const SETTINGS_DIR = settingsDirectory();
 const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
-const SETTINGS_RESOURCE_URI = "ui://deepseek-subagent/settings/v4.html";
-const LEGACY_SETTINGS_RESOURCE_URIS = ["ui://deepseek-subagent/settings/v3.html", "ui://deepseek-subagent/settings/v2.html", "ui://deepseek-subagent/settings/v1.html"];
+const SETTINGS_RESOURCE_URI = "ui://deepseek-subagent/settings/v5.html";
+const LEGACY_SETTINGS_RESOURCE_URIS = ["ui://deepseek-subagent/settings/v4.html", "ui://deepseek-subagent/settings/v3.html", "ui://deepseek-subagent/settings/v2.html", "ui://deepseek-subagent/settings/v1.html"];
 const SETTINGS_MIME_TYPE = "text/html;profile=mcp-app";
-const DEFAULT_SETTINGS = Object.freeze({ schemaVersion: 2, revision: 0, model: "", apiKey: null });
+const OFFICIAL_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/";
+const TEST_DEEPSEEK_BASE_URL = process.env.NODE_ENV === "test" && process.env.DEEPSEEK_SUBAGENT_TEST_SETTINGS_FILE === SETTINGS_FILE
+  ? process.env.DEEPSEEK_SUBAGENT_API_BASE_URL
+  : "";
+const DEFAULT_DEEPSEEK_BASE_URL = normalizeApiBaseUrl(TEST_DEEPSEEK_BASE_URL || OFFICIAL_DEEPSEEK_BASE_URL);
+const DEFAULT_SETTINGS = Object.freeze({ schemaVersion: 2, revision: 0, model: "", apiKey: null, baseUrl: DEFAULT_DEEPSEEK_BASE_URL });
 const MODEL_ID_PATTERN = /^deepseek-[A-Za-z0-9][A-Za-z0-9._:/-]{0,118}$/;
 const RESPONSES_MODELS_NOT_LISTED_BY_API = Object.freeze(["deepseek-flash"]);
 const MODELS_CACHE_MS = 5 * 60 * 1000;
@@ -46,19 +51,22 @@ function settingsDirectory() {
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "deepseek-subagent");
 }
 
-function apiBaseUrl() {
-  const testOverride = process.env.NODE_ENV === "test" && process.env.DEEPSEEK_SUBAGENT_TEST_SETTINGS_FILE === SETTINGS_FILE
-    ? process.env.DEEPSEEK_SUBAGENT_API_BASE_URL
-    : "";
-  const parsed = new URL(testOverride || "https://api.deepseek.com/v1/");
+function normalizeApiBaseUrl(value) {
+  if (typeof value !== "string" || value !== value.trim() || Buffer.byteLength(value, "utf8") < 1 || Buffer.byteLength(value, "utf8") > 2048) {
+    throw new Error("DeepSeek API base URL must be 1–2048 UTF-8 bytes with no leading or trailing whitespace.");
+  }
+  let parsed;
+  try { parsed = new URL(value); }
+  catch { throw new Error("DeepSeek API base URL must be an absolute HTTPS URL."); }
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new Error("DeepSeek API base URL must be an HTTP(S) URL without credentials, query, or fragment.");
   }
-  if (parsed.protocol === "http:" && !["127.0.0.1", "localhost", "::1"].includes(parsed.hostname)) {
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (parsed.protocol === "http:" && !["127.0.0.1", "localhost", "::1"].includes(hostname)) {
     throw new Error("DeepSeek API base URL must use HTTPS unless it is loopback-only.");
   }
   if (!parsed.pathname.endsWith("/")) parsed.pathname += "/";
-  return parsed;
+  return parsed.toString();
 }
 
 function emptyObjectSchema() {
@@ -73,10 +81,10 @@ function settingsOutputSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["schemaVersion", "revision", "model", "credentialConfigured", "credentialMask", "nativeReady", "message"],
+    required: ["schemaVersion", "revision", "model", "baseUrl", "credentialConfigured", "credentialMask", "nativeReady", "message"],
     properties: {
       schemaVersion: { type: "integer", const: 2 }, revision: { type: "integer", minimum: 0 },
-      model: { type: "string", maxLength: 128 }, credentialConfigured: { type: "boolean" },
+      model: { type: "string", maxLength: 128 }, baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" }, credentialConfigured: { type: "boolean" },
       credentialMask: { type: "string", enum: ["", "••••••••"] },
       nativeReady: { type: "boolean" }, message: { type: "string" },
     },
@@ -163,13 +171,14 @@ const tools = [
     _meta: { ui: { visibility: ["app"] } },
   },
   {
-    name: "deepseek_credential_set", title: "Save DeepSeek API key",
-    description: "Store a DeepSeek API key locally. Never returns the key.",
+    name: "deepseek_credential_set", title: "Save DeepSeek connection",
+    description: "Store a DeepSeek API base URL and optionally replace the local API key. Never returns the key.",
     inputSchema: {
-      type: "object", additionalProperties: false, required: ["expectedRevision", "apiKey"],
+      type: "object", additionalProperties: false, required: ["expectedRevision", "baseUrl"],
       properties: {
         expectedRevision: { type: "integer", minimum: 0 },
         apiKey: { type: "string", minLength: 8, maxLength: 4096, format: "password" },
+        baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" },
       },
     },
     outputSchema: settingsOutputSchema(),
@@ -212,6 +221,7 @@ function classifiedError(error) {
   const message = error instanceof Error ? error.message : "DeepSeek Subagent operation failed.";
   const rules = [
     [/DeepSeek settings file.*(?:invalid|contains invalid JSON)/i, "SETTINGS_INVALID"],
+    [/API base URL/i, "INVALID_BASE_URL"],
     [/API key.*(?:invalid|must be)|Invalid DeepSeek API key/i, "INVALID_API_KEY"],
     [/not configured|Save an API key and model first/i, "NOT_CONFIGURED"],
     [/Select a model|selected model.*(?:not available|no longer available)|Invalid DeepSeek model/i, "MODEL_UNAVAILABLE"],
@@ -268,9 +278,13 @@ function parseSettingsSnapshot(snapshot) {
     throw error;
   }
   const valid = [1, 2].includes(parsed?.schemaVersion) && Number.isInteger(parsed.revision) && parsed.revision >= 0 &&
-    (parsed.model === "" || validModelId(parsed.model)) && (parsed.apiKey == null || validApiKey(parsed.apiKey));
+    (parsed.model === "" || validModelId(parsed.model)) && (parsed.apiKey == null || validApiKey(parsed.apiKey)) &&
+    (parsed.baseUrl === undefined || typeof parsed.baseUrl === "string");
   if (!valid) throw new Error("The DeepSeek settings file is invalid. Delete it and save settings again.");
-  return { schemaVersion: 2, revision: parsed.revision, model: parsed.model || "", apiKey: parsed.apiKey || null };
+  let baseUrl;
+  try { baseUrl = normalizeApiBaseUrl(parsed.baseUrl === undefined ? DEFAULT_DEEPSEEK_BASE_URL : parsed.baseUrl); }
+  catch { throw new Error("The DeepSeek settings file contains an invalid API base URL. Delete it and save settings again."); }
+  return { schemaVersion: 2, revision: parsed.revision, model: parsed.model || "", apiKey: parsed.apiKey || null, baseUrl };
 }
 
 async function readSettings() {
@@ -381,58 +395,61 @@ async function writeSettings(expectedRevision, patch) {
   const next = { ...current, ...patch, schemaVersion: 2, revision: current.revision + 1 };
   if (next.model !== "" && !validModelId(next.model)) throw new Error("Invalid DeepSeek model ID.");
   if (next.apiKey !== null && !validApiKey(next.apiKey)) throw new Error("Invalid DeepSeek API key.");
+  next.baseUrl = normalizeApiBaseUrl(next.baseUrl);
   const contents = `${JSON.stringify(next, null, 2)}\n`;
   await atomicWriteSettings(contents, 0o600, snapshot);
   return { settings: next, contents };
 }
 
-async function getCredential() {
-  const { apiKey } = await readSettings();
-  if (!validApiKey(apiKey)) throw new Error("DeepSeek API key is not configured. Open Settings → Integrations → DeepSeek Subagent.");
-  return apiKey;
+async function getConnectionSettings() {
+  const settings = await readSettings();
+  if (!validApiKey(settings.apiKey)) throw new Error("DeepSeek API key is not configured. Open Settings → Integrations → DeepSeek Subagent.");
+  return settings;
 }
 
 async function ensureNative(settings, models = []) {
-  if (!validApiKey(settings.apiKey) || !settings.model) return nativeIntegrationStatus(SETTINGS_DIR, settings.model, apiBaseUrl().toString());
+  if (!validApiKey(settings.apiKey) || !settings.model) return nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
   await installNativeIntegration({
     settingsDir: SETTINGS_DIR, settingsFile: SETTINGS_FILE, model: settings.model,
     models: models.length ? models : [{ id: settings.model }], modelTemplateFile: MODEL_TEMPLATE,
-    apiBaseUrl: apiBaseUrl().toString(),
+    apiBaseUrl: settings.baseUrl,
   });
-  return nativeIntegrationStatus(SETTINGS_DIR, settings.model, apiBaseUrl().toString());
+  return nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
 }
 
 async function recoverConfiguredNative() {
   const observed = await readSettings();
   if (!validApiKey(observed.apiKey) || !observed.model) return { ready: false, skipped: true };
-  const existing = await nativeIntegrationStatus(SETTINGS_DIR, observed.model, apiBaseUrl().toString());
+  const existing = await nativeIntegrationStatus(SETTINGS_DIR, observed.model, observed.baseUrl);
   if (existing.ready) return existing;
   return queueSettingsMutation(async () => {
     const current = await readSettings();
-    if (current.revision !== observed.revision || current.model !== observed.model || current.apiKey !== observed.apiKey) {
+    if (current.revision !== observed.revision || current.model !== observed.model || current.apiKey !== observed.apiKey || current.baseUrl !== observed.baseUrl) {
       return { ready: false, skipped: true };
     }
-    const latest = await nativeIntegrationStatus(SETTINGS_DIR, current.model, apiBaseUrl().toString());
+    const latest = await nativeIntegrationStatus(SETTINGS_DIR, current.model, current.baseUrl);
     if (latest.ready) return latest;
     await ensureNative(current);
-    return nativeIntegrationStatus(SETTINGS_DIR, current.model, apiBaseUrl().toString());
+    return nativeIntegrationStatus(SETTINGS_DIR, current.model, current.baseUrl);
   });
 }
 
 async function settingsSnapshot(message, source = null) {
   const settings = source || await readSettings();
   const configured = validApiKey(settings.apiKey);
-  const native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, apiBaseUrl().toString());
+  const native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
   return {
-    schemaVersion: 2, revision: settings.revision, model: settings.model,
+    schemaVersion: 2, revision: settings.revision, model: settings.model, baseUrl: settings.baseUrl,
     credentialConfigured: configured, credentialMask: configured ? "••••••••" : "",
     nativeReady: native.ready, message,
   };
 }
 
 async function fetchModels({ force = false } = {}) {
-  let apiKey = await getCredential();
-  const fingerprint = createHash("sha256").update(apiKey).digest("hex");
+  const connection = await getConnectionSettings();
+  let apiKey = connection.apiKey;
+  const baseUrl = connection.baseUrl;
+  const fingerprint = createHash("sha256").update(apiKey).update("\0").update(baseUrl).digest("hex");
   if (!force && modelsCache?.fingerprint === fingerprint && Date.now() - modelsCache.fetchedAt < MODELS_CACHE_MS) {
     apiKey = "";
     return modelsCache.models.map((model) => ({ ...model }));
@@ -441,7 +458,7 @@ async function fetchModels({ force = false } = {}) {
   const timer = setTimeout(() => controller.abort(), 30_000);
   let response;
   try {
-    response = await fetch(new URL("models", apiBaseUrl()), {
+    response = await fetch(new URL("models", baseUrl), {
       method: "GET", headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" }, signal: controller.signal,
     });
   } catch (error) {
@@ -471,12 +488,14 @@ async function fetchModels({ force = false } = {}) {
 }
 
 async function probeResponses(model) {
-  let apiKey = await getCredential();
+  const connection = await getConnectionSettings();
+  let apiKey = connection.apiKey;
+  const baseUrl = connection.baseUrl;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
   let response;
   try {
-    response = await fetch(new URL("responses", apiBaseUrl()), {
+    response = await fetch(new URL("responses", baseUrl), {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, accept: "application/json", "content-type": "application/json" },
       body: JSON.stringify({ model, input: "Reply with OK.", max_output_tokens: 8, stream: false }),
@@ -524,15 +543,15 @@ async function prepareNativeDelegation(args) {
   if (!validApiKey(settings.apiKey) || !settings.model) {
     throw new Error("DeepSeek native delegation is not configured. Save an API key and model first.");
   }
-  let native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, apiBaseUrl().toString());
+  let native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
   if (!native.ready) {
     native = await queueSettingsMutation(async () => {
       const current = await readSettings();
-      if (current.revision !== settings.revision || current.model !== settings.model || current.apiKey !== settings.apiKey) {
+      if (current.revision !== settings.revision || current.model !== settings.model || current.apiKey !== settings.apiKey || current.baseUrl !== settings.baseUrl) {
         throw new Error("DeepSeek settings changed while the native router was being recovered. Retry the delegation.");
       }
       await ensureNative(current);
-      return nativeIntegrationStatus(SETTINGS_DIR, current.model, apiBaseUrl().toString());
+      return nativeIntegrationStatus(SETTINGS_DIR, current.model, current.baseUrl);
     });
   }
   if (!native.ready) throw new Error("DeepSeek native integration could not be recovered. Save the selected model again, then start a new Codex task.");
@@ -544,7 +563,7 @@ async function prepareNativeDelegation(args) {
   let runtime;
   try { runtime = JSON.parse(await readFile(runtimeFile, "utf8")); }
   catch { throw new Error("DeepSeek router runtime state is invalid."); }
-  if (runtime?.schemaVersion !== 2 || runtime.selectedModel !== settings.model ||
+  if (runtime?.schemaVersion !== 2 || runtime.selectedModel !== settings.model || runtime.deepseekBaseUrl !== settings.baseUrl ||
       !Number.isInteger(runtime.port) || runtime.port < 1024 || runtime.port > 65535 ||
       !/^[a-f0-9]{48}$/.test(runtime.routeToken || "") || !/^[a-f0-9]{48}$/.test(runtime.instanceId || "") ||
       !/^[a-f0-9]{48}$/.test(runtime.shutdownToken || "")) {
@@ -588,11 +607,29 @@ async function callTool(name, args) {
     return resultText("Native DeepSeek delegation prepared in loopback memory.", prepared);
   }
   case "deepseek_credential_set": {
-    if (!validApiKey(args?.apiKey)) throw new Error("API key must be 8–4096 UTF-8 bytes with no leading/trailing whitespace or newline.");
+    const baseUrl = normalizeApiBaseUrl(args?.baseUrl);
+    if (args?.apiKey !== undefined && !validApiKey(args.apiKey)) throw new Error("API key must be 8–4096 UTF-8 bytes with no leading/trailing whitespace or newline.");
     return queueSettingsMutation(async () => {
       modelsCache = null;
-      const { settings } = await writeSettings(args?.expectedRevision, { apiKey: args.apiKey });
-      return resultText("DeepSeek API key saved.", await settingsSnapshot("API key saved.", settings));
+      const snapshot = await settingsFileSnapshot();
+      const current = parseSettingsSnapshot(snapshot);
+      const apiKey = args?.apiKey === undefined ? current.apiKey : args.apiKey;
+      if (!validApiKey(apiKey)) throw new Error("API key must be provided when DeepSeek has not been configured yet.");
+      const baseUrlChanged = current.baseUrl !== baseUrl;
+      if (baseUrlChanged && current.model) await validateLegacyCredentialHelper(SETTINGS_DIR);
+      const written = await writeSettings(args?.expectedRevision, { apiKey, baseUrl, ...(baseUrlChanged ? { model: "" } : {}) });
+      try {
+        if (baseUrlChanged && current.model) await removeNativeIntegration(SETTINGS_DIR);
+        const message = baseUrlChanged && current.model
+          ? "Connection saved. Refresh and save a model again to activate the new API base URL."
+          : "Connection saved.";
+        return resultText("DeepSeek connection saved.", await settingsSnapshot(message, written.settings));
+      } catch (error) {
+        await restoreSettingsSnapshot(snapshot, written.contents).catch((rollbackError) => {
+          throw new AggregateError([error, rollbackError], "Connection save failed and settings rollback was incomplete.");
+        });
+        throw error;
+      }
     });
   }
   case "deepseek_credential_delete": {

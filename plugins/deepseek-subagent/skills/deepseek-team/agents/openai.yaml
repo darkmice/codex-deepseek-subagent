@@ -1,0 +1,4 @@
+interface:
+  display_name: "DeepSeek Team"
+  short_description: "GPT plans and reviews while DeepSeek executes"
+  default_prompt: "Use $deepseek-team to plan this task with GPT, delegate bounded execution to DeepSeek, and complete final QA with GPT."
