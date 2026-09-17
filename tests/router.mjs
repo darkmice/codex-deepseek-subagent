@@ -195,7 +195,12 @@ const routerPort = await new Promise((resolvePort, rejectPort) => {
   });
 });
 
-await writeFile(settingsFile, `${JSON.stringify({ model: "deepseek-flash", apiKey: "deepseek-test-key" })}\n`);
+await writeFile(settingsFile, `${JSON.stringify({
+  schemaVersion: 2,
+  revision: 1,
+  model: "deepseek-flash",
+  apiKey: "deepseek-test-key",
+})}\n`);
 const validCatalog = { models: [{ slug: "deepseek-flash", visibility: "hide", priority: 10_000, supported_in_api: true, input_modalities: ["text", "image"], supports_image_detail_original: true }] };
 await writeFile(catalogFile, `${JSON.stringify(validCatalog)}\n`);
 await writeFile(runtimeFile, `${JSON.stringify({

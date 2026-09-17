@@ -4,10 +4,10 @@ import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { brotliDecompress, gunzip, inflate } from "node:zlib";
+import { CredentialRuntimePool, credentialsFromSettingsDocument, failoverReason } from "./credential-pool.mjs";
 
 const runtimeFile = process.argv[2];
 if (!runtimeFile) throw new Error("DeepSeek router runtime file is required.");
-
 const requiredRuntimeFields = [
   "routeToken", "instanceId", "shutdownToken", "executionMode", "port", "settingsFile", "catalogFile",
   "selectedModel", "deepseekBaseUrl", "parentBaseUrl",
@@ -35,6 +35,10 @@ function validateRuntime(runtime) {
 }
 async function loadRuntime() { return validateRuntime(JSON.parse(await readFile(runtimeFile, "utf8"))); }
 const initialRuntime = await loadRuntime();
+// Schema v1/v2 settings do not carry a per-connection endpoint. During their
+// read-only migration, preserve the endpoint that created this router instead
+// of silently falling back to the public DeepSeek service.
+const defaultDeepSeekBaseUrl = initialRuntime.deepseekBaseUrl;
 const testTiming = process.env.NODE_ENV === "test" && initialRuntime?.testTiming && typeof initialRuntime.testTiming === "object"
   ? initialRuntime.testTiming
   : {};
@@ -44,6 +48,7 @@ const maxRequestBytes = 32 * 1024 * 1024;
 const maxBufferedBytes = 64 * 1024 * 1024;
 const maxModelsResponseBytes = 8 * 1024 * 1024;
 const maxConcurrentRequests = 8;
+const maxCredentialControlBytes = 4 * 1024;
 const upstreamHeaderTimeoutMs = 60_000;
 const upstreamIdleTimeoutMs = 120_000;
 const upstreamOverallTimeoutMs = 30 * 60_000;
@@ -68,20 +73,17 @@ let bufferedBytes = 0;
 const provenanceKey = randomBytes(32);
 const counters = {
   parentRequests: 0, parentUpstreamResponses: 0, deepseekRequests: 0, deepseekUpstreamResponses: 0,
+  deepseekAttempts: 0, deepseekFailovers: 0,
   delegationsPrepared: 0, delegationsInjected: 0, delegationMisses: 0,
 };
 const delegationRecords = new Map();
+const credentialPool = new CredentialRuntimePool();
 const decompress = {
   br: promisify(brotliDecompress),
   deflate: promisify(inflate),
   gzip: promisify(gunzip),
   "x-gzip": promisify(gunzip),
 };
-
-function validCredential(value) {
-  return typeof value === "string" && value === value.trim() && Buffer.byteLength(value, "utf8") >= 8 &&
-    Buffer.byteLength(value, "utf8") <= 4096 && !/[\r\n]/.test(value);
-}
 
 function routerError(code, message, statusCode) {
   return Object.assign(new Error(message), { code, statusCode });
@@ -191,6 +193,7 @@ function prepareDelegation(payload) {
     message: payload.message, createdAt: now, expiresAt, active: false,
     idleExpiresAt: 0, absoluteExpiresAt: now + activeDelegationAbsoluteTtlMs,
     reasoningDigests: new Map(), reasoningCipherDigests: new Map(),
+    credentialId: "", credentialBindingTail: Promise.resolve(),
   };
   delegationRecords.set(taskName, record);
   const expiryTimer = setTimeout(() => {
@@ -301,6 +304,14 @@ function injectDelegationMessages(payload) {
   return inspected;
 }
 
+async function acquireCredentialBinding(record) {
+  const predecessor = record.credentialBindingTail;
+  let release;
+  record.credentialBindingTail = new Promise((resolveRelease) => { release = resolveRelease; });
+  await predecessor;
+  return release;
+}
+
 function upstreamUrl(baseUrl, suffix, query) {
   const base = new URL(baseUrl);
   base.pathname = `${base.pathname.replace(/\/$/, "")}${suffix}`;
@@ -308,7 +319,7 @@ function upstreamUrl(baseUrl, suffix, query) {
   return base;
 }
 
-async function readResponseBodyLimited(body, resetIdleTimer) {
+async function readResponseBodyLimited(body, resetIdleTimer, limit = maxModelsResponseBytes, errorMessage = "Parent model catalog is too large.") {
   if (!body) return Buffer.alloc(0);
   const chunks = [];
   let size = 0;
@@ -316,8 +327,8 @@ async function readResponseBodyLimited(body, resetIdleTimer) {
   for await (const chunk of Readable.fromWeb(body)) {
     resetIdleTimer();
     size += chunk.length;
-    if (size > maxModelsResponseBytes) {
-      throw Object.assign(new Error("Parent model catalog is too large."), { statusCode: 502 });
+    if (size > limit) {
+      throw Object.assign(new Error(errorMessage), { statusCode: 502 });
     }
     chunks.push(chunk);
   }
@@ -847,16 +858,34 @@ async function proxy(request, response, body) {
   let upstreamBody = body;
   let bodyRewritten = false;
   let delegation = null;
+  let deepseekCandidates = [];
+  let deepseekCredentialValues = [];
+  let releaseCredentialBinding = null;
   if (routeToDeepSeek) {
-    const settings = JSON.parse(await readFile(runtime.settingsFile, "utf8"));
-    if (settings?.model !== runtime.selectedModel) throw Object.assign(new Error("DeepSeek model configuration changed."), { statusCode: 503 });
-    if (!validCredential(settings?.apiKey)) throw Object.assign(new Error("DeepSeek credential is unavailable."), { statusCode: 503 });
     delegation = injectDelegationMessages(payload);
-    bodyRewritten = true;
-    upstreamBody = Buffer.from(JSON.stringify(payload));
-    headers = deepseekHeaders(settings.apiKey, request.headers, bodyRewritten);
-    baseUrl = runtime.deepseekBaseUrl;
-    counters.deepseekRequests++;
+    if (!delegation.prepared.credentialId) releaseCredentialBinding = await acquireCredentialBinding(delegation.prepared);
+    try {
+      if (delegationRecords.get(delegation.taskName) !== delegation.prepared || !delegation.prepared.active) {
+        throw Object.assign(new Error("DeepSeek task expired before credential binding."), { statusCode: 409 });
+      }
+      const settings = JSON.parse(await readFile(runtime.settingsFile, "utf8"));
+      if (settings?.model !== runtime.selectedModel) throw Object.assign(new Error("DeepSeek model configuration changed."), { statusCode: 503 });
+      let credentials;
+      try { credentials = credentialsFromSettingsDocument(settings, { defaultBaseUrl: defaultDeepSeekBaseUrl }); }
+      catch { throw Object.assign(new Error("DeepSeek credential pool is invalid."), { statusCode: 503 }); }
+      deepseekCredentialValues = credentials.map((credential) => credential.apiKey);
+      credentialPool.sync(settings?.revision);
+      deepseekCandidates = credentialPool.candidates(credentials, { pinnedId: delegation.prepared.credentialId || "" });
+      if (!deepseekCandidates.length) throw Object.assign(new Error("No enabled DeepSeek credential is currently available."), { statusCode: 503 });
+      bodyRewritten = true;
+      upstreamBody = Buffer.from(JSON.stringify(payload));
+      baseUrl = deepseekCandidates[0].baseUrl;
+      counters.deepseekRequests++;
+    } catch (error) {
+      releaseCredentialBinding?.();
+      releaseCredentialBinding = null;
+      throw error;
+    }
   } else {
     if (typeof request.headers.authorization !== "string" || request.headers.authorization.length < 16) {
       throw Object.assign(new Error("Parent provider authorization is unavailable."), { statusCode: 401 });
@@ -873,24 +902,65 @@ async function proxy(request, response, body) {
   response.on("close", () => { if (!response.writableEnded) controller.abort(); });
   let idleTimer = null;
   try {
-    const upstream = await fetch(upstreamUrl(baseUrl, suffix, routeToDeepSeek ? "" : requestUrl.search), {
-      method: request.method,
-      headers,
-      body: request.method === "GET" || request.method === "HEAD" ? undefined : upstreamBody,
-      redirect: "error",
-      signal: controller.signal,
-    });
-    if (routeToDeepSeek) counters.deepseekUpstreamResponses++;
-    else counters.parentUpstreamResponses++;
+    let upstream;
+    let selectedCredential = null;
+    const attempts = routeToDeepSeek ? deepseekCandidates : [null];
+    for (let index = 0; index < attempts.length; index++) {
+      selectedCredential = attempts[index];
+      if (routeToDeepSeek) {
+        headers = deepseekHeaders(selectedCredential.apiKey, request.headers, bodyRewritten);
+        baseUrl = selectedCredential.baseUrl;
+        counters.deepseekAttempts++;
+      }
+      upstream = await fetch(upstreamUrl(baseUrl, suffix, routeToDeepSeek ? "" : requestUrl.search), {
+        method: request.method,
+        headers,
+        body: request.method === "GET" || request.method === "HEAD" ? undefined : upstreamBody,
+        redirect: "error",
+        signal: controller.signal,
+      });
+      if (routeToDeepSeek) counters.deepseekUpstreamResponses++;
+      else counters.parentUpstreamResponses++;
+      const reason = routeToDeepSeek ? failoverReason(upstream.status) : "";
+      if (!reason) break;
+      credentialPool.markFailure(selectedCredential.id, reason);
+      const pinned = Boolean(delegation.prepared.credentialId);
+      if (pinned || index === attempts.length - 1) break;
+      try { await upstream.body?.cancel(); } catch {}
+      counters.deepseekFailovers++;
+    }
+    if (routeToDeepSeek && upstream.ok) {
+      credentialPool.markSuccess(selectedCredential.id);
+      if (!delegation.prepared.credentialId) delegation.prepared.credentialId = selectedCredential.id;
+      else if (delegation.prepared.credentialId !== selectedCredential.id) {
+        throw Object.assign(new Error("DeepSeek task credential binding changed unexpectedly."), { statusCode: 409 });
+      }
+    }
     clearTimeout(headerTimer);
     const resetIdleTimer = () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => controller.abort(), upstreamIdleTimeoutMs);
     };
+    if (routeToDeepSeek && !upstream.ok) {
+      try { await upstream.body?.cancel(); } catch {}
+      response.writeHead(upstream.status, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify({ error: { code: "DEEPSEEK_UPSTREAM_ERROR", message: `DeepSeek upstream returned HTTP ${upstream.status}.` } }));
+      return;
+    }
     const responseHeaders = {};
-    for (const [name, value] of upstream.headers) {
-      if (!["content-length", "content-encoding", "transfer-encoding", "connection"].includes(name) && !(modelsRequest && name === "etag")) {
-        responseHeaders[name] = value;
+    if (routeToDeepSeek) {
+      if (upstream.headers.get("content-encoding")) {
+        throw Object.assign(new Error("DeepSeek returned an unsupported encoded response."), { statusCode: 502 });
+      }
+      responseHeaders["cache-control"] = "no-store";
+      responseHeaders["content-type"] = String(upstream.headers.get("content-type") || "").toLowerCase().startsWith("text/event-stream")
+        ? "text/event-stream"
+        : "application/json";
+    } else {
+      for (const [name, value] of upstream.headers) {
+        if (!["content-length", "content-encoding", "transfer-encoding", "connection"].includes(name) && !(modelsRequest && name === "etag")) {
+          responseHeaders[name] = value;
+        }
       }
     }
     if (modelsRequest && upstream.ok) {
@@ -914,6 +984,21 @@ async function proxy(request, response, body) {
       throw Object.assign(new Error("Parent model catalog returned an unusable not-modified response."), { statusCode: 502 });
     }
     const observer = routeToDeepSeek && upstream.ok ? provenanceObserver(upstream.headers.get("content-type")) : null;
+    const credentialNeedles = routeToDeepSeek ? deepseekCredentialValues.map((value) => Buffer.from(value, "utf8")) : [];
+    const credentialTails = credentialNeedles.map(() => Buffer.alloc(0));
+    const assertCredentialNotReflected = (chunk) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      for (let index = 0; index < credentialNeedles.length; index++) {
+        const needle = credentialNeedles[index];
+        const tail = credentialTails[index];
+        const combined = tail.length ? Buffer.concat([tail, bytes]) : bytes;
+        if (combined.includes(needle)) {
+          throw Object.assign(new Error("DeepSeek response reflected a configured authorization credential."), { statusCode: 502 });
+        }
+        const tailLength = Math.min(Math.max(needle.length - 1, 0), combined.length);
+        credentialTails[index] = tailLength ? combined.subarray(combined.length - tailLength) : Buffer.alloc(0);
+      }
+    };
     response.writeHead(upstream.status, responseHeaders);
     if (!upstream.body) { response.end(); return; }
     resetIdleTimer();
@@ -922,6 +1007,7 @@ async function proxy(request, response, body) {
       const forward = observer?.feed(chunk);
       const outgoing = observer?.streaming ? forward : [chunk];
       for (const forwardedChunk of outgoing) {
+        assertCredentialNotReflected(forwardedChunk);
         if (!response.write(forwardedChunk) && !await waitForDrainOrClose(response)) {
           controller.abort();
           return;
@@ -931,6 +1017,10 @@ async function proxy(request, response, body) {
     if (observer) {
       const observed = observer.finish();
       const candidates = observer.streaming ? observed.candidates : observed;
+      if (observer.streaming) {
+        for (const forwardedChunk of observed.forward) assertCredentialNotReflected(forwardedChunk);
+        assertCredentialNotReflected(observed.terminalBlock);
+      }
       commitReasoningProvenance(delegation.taskName, delegation.prepared, candidates);
       if (observer.streaming) {
         for (const forwardedChunk of observed.forward) {
@@ -941,17 +1031,73 @@ async function proxy(request, response, body) {
     }
     response.end();
   } finally {
+    releaseCredentialBinding?.();
     clearTimeout(headerTimer);
     clearTimeout(overallTimer);
     clearTimeout(idleTimer);
   }
 }
 
+async function credentialHealth() {
+  try {
+    const settings = JSON.parse(await readFile(initialRuntime.settingsFile, "utf8"));
+    const credentials = credentialsFromSettingsDocument(settings, { defaultBaseUrl: defaultDeepSeekBaseUrl });
+    credentialPool.sync(settings?.revision);
+    const statuses = credentialPool.statuses(credentials);
+    return credentials.map((credential) => ({
+      id: credential.id,
+      status: credential.enabled ? statuses.get(credential.id)?.status || "ready" : "disabled",
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function applyCredentialFailure(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+      Object.keys(payload).some((key) => !["revision", "id", "reason"].includes(key)) ||
+      !Number.isInteger(payload.revision) || !["invalid", "exhausted"].includes(payload.reason)) {
+    throw Object.assign(new Error("Invalid credential failure update."), { statusCode: 400 });
+  }
+  let settings;
+  try { settings = JSON.parse(await readFile(initialRuntime.settingsFile, "utf8")); }
+  catch { throw Object.assign(new Error("DeepSeek credential settings are unavailable."), { statusCode: 503 }); }
+  let credentials;
+  try { credentials = credentialsFromSettingsDocument(settings, { defaultBaseUrl: defaultDeepSeekBaseUrl }); }
+  catch { throw Object.assign(new Error("DeepSeek credential pool is invalid."), { statusCode: 503 }); }
+  if (settings?.revision !== payload.revision || !credentials.some((credential) => credential.enabled && credential.id === payload.id)) {
+    throw Object.assign(new Error("Credential failure update does not match the active settings revision."), { statusCode: 409 });
+  }
+  credentialPool.sync(settings.revision);
+  credentialPool.markFailure(payload.id, payload.reason);
+}
+
 const server = createServer(async (request, response) => {
   try {
     if (request.method === "GET" && request.url === `/${initialRuntime.routeToken}/healthz`) {
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      response.end(JSON.stringify({ status: "ok", instanceId: initialRuntime.instanceId, routerPid: process.pid, ...counters }));
+      response.end(JSON.stringify({ status: "ok", instanceId: initialRuntime.instanceId, routerPid: process.pid, ...counters, credentials: await credentialHealth() }));
+      return;
+    }
+    if (request.method === "POST" && request.url === `/${initialRuntime.routeToken}/control/credential-failure`) {
+      if (request.headers.authorization !== `Bearer ${initialRuntime.shutdownToken}` || request.headers["content-encoding"] ||
+          String(request.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+        request.resume();
+        response.writeHead(403, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify({ error: { code: "CREDENTIAL_CONTROL_FORBIDDEN", message: "Credential state update was not authorized." } }));
+        return;
+      }
+      const read = await readRequestBody(request, maxCredentialControlBytes);
+      try {
+        let payload;
+        try { payload = JSON.parse(read.body.toString("utf8")); }
+        catch { throw Object.assign(new Error("Credential failure update body is not valid JSON."), { statusCode: 400 }); }
+        await applyCredentialFailure(payload);
+        response.writeHead(204, { "cache-control": "no-store" });
+        response.end();
+      } finally {
+        bufferedBytes -= Math.min(read.reservedBytes, bufferedBytes);
+      }
       return;
     }
     if (process.env.NODE_ENV === "test" && request.method === "POST" &&

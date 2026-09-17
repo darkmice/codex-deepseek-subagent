@@ -4,6 +4,22 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  createCredential,
+  CredentialRuntimePool,
+  credentialsFromSettings,
+  credentialsFromSettingsDocument,
+  DEFAULT_DEEPSEEK_BASE_URL as OFFICIAL_DEEPSEEK_BASE_URL,
+  enabledCredentials,
+  failoverReason,
+  MAX_CREDENTIALS,
+  mergeCredentialStatuses,
+  normalizeApiBaseUrl,
+  normalizeCredentialLabel,
+  publicCredentials,
+  validApiKey,
+  validCredentialId,
+} from "./credential-pool.mjs";
+import {
   installNativeIntegration,
   nativeIntegrationStatus,
   nativePaths,
@@ -14,28 +30,28 @@ import {
 } from "./native-config.mjs";
 
 const SERVER_NAME = "deepseek-settings";
-const SERVER_VERSION = "0.6.0+codex.20260916122412";
+const SERVER_VERSION = "0.7.0+codex.20260917054058";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = dirname(SCRIPT_DIR);
 const MODEL_TEMPLATE = join(PLUGIN_DIR, "assets", "model-template.json");
 const SETTINGS_HTML = join(PLUGIN_DIR, "assets", "settings.html");
 const SETTINGS_DIR = settingsDirectory();
 const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
-const SETTINGS_RESOURCE_URI = "ui://deepseek-subagent/settings/v5.html";
-const LEGACY_SETTINGS_RESOURCE_URIS = ["ui://deepseek-subagent/settings/v4.html", "ui://deepseek-subagent/settings/v3.html", "ui://deepseek-subagent/settings/v2.html", "ui://deepseek-subagent/settings/v1.html"];
+const SETTINGS_RESOURCE_URI = "ui://deepseek-subagent/settings/v7.html";
+const LEGACY_SETTINGS_RESOURCE_URIS = ["ui://deepseek-subagent/settings/v6.html", "ui://deepseek-subagent/settings/v5.html", "ui://deepseek-subagent/settings/v4.html", "ui://deepseek-subagent/settings/v3.html", "ui://deepseek-subagent/settings/v2.html", "ui://deepseek-subagent/settings/v1.html"];
 const SETTINGS_MIME_TYPE = "text/html;profile=mcp-app";
-const OFFICIAL_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/";
 const TEST_DEEPSEEK_BASE_URL = process.env.NODE_ENV === "test" && process.env.DEEPSEEK_SUBAGENT_TEST_SETTINGS_FILE === SETTINGS_FILE
   ? process.env.DEEPSEEK_SUBAGENT_API_BASE_URL
   : "";
 const DEFAULT_DEEPSEEK_BASE_URL = normalizeApiBaseUrl(TEST_DEEPSEEK_BASE_URL || OFFICIAL_DEEPSEEK_BASE_URL);
-const DEFAULT_SETTINGS = Object.freeze({ schemaVersion: 2, revision: 0, model: "", apiKey: null, baseUrl: DEFAULT_DEEPSEEK_BASE_URL });
+const DEFAULT_SETTINGS = Object.freeze({ schemaVersion: 4, revision: 0, model: "", credentials: [], baseUrl: DEFAULT_DEEPSEEK_BASE_URL });
 const MODEL_ID_PATTERN = /^deepseek-[A-Za-z0-9][A-Za-z0-9._:/-]{0,118}$/;
 const RESPONSES_MODELS_NOT_LISTED_BY_API = Object.freeze(["deepseek-flash"]);
 const MODELS_CACHE_MS = 5 * 60 * 1000;
 const MAX_DELEGATION_MESSAGE_BYTES = 512 * 1024;
 const TASK_BASE_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
 let modelsCache = null;
+const settingsCredentialPool = new CredentialRuntimePool();
 let settingsMutationQueue = Promise.resolve();
 let cleanupReconcileTimer = null;
 let cleanupReconcileDueAt = 0;
@@ -51,24 +67,6 @@ function settingsDirectory() {
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "deepseek-subagent");
 }
 
-function normalizeApiBaseUrl(value) {
-  if (typeof value !== "string" || value !== value.trim() || Buffer.byteLength(value, "utf8") < 1 || Buffer.byteLength(value, "utf8") > 2048) {
-    throw new Error("DeepSeek API base URL must be 1–2048 UTF-8 bytes with no leading or trailing whitespace.");
-  }
-  let parsed;
-  try { parsed = new URL(value); }
-  catch { throw new Error("DeepSeek API base URL must be an absolute HTTPS URL."); }
-  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error("DeepSeek API base URL must be an HTTP(S) URL without credentials, query, or fragment.");
-  }
-  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (parsed.protocol === "http:" && !["127.0.0.1", "localhost", "::1"].includes(hostname)) {
-    throw new Error("DeepSeek API base URL must use HTTPS unless it is loopback-only.");
-  }
-  if (!parsed.pathname.endsWith("/")) parsed.pathname += "/";
-  return parsed.toString();
-}
-
 function emptyObjectSchema() {
   return { type: "object", properties: {}, additionalProperties: false };
 }
@@ -81,11 +79,25 @@ function settingsOutputSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["schemaVersion", "revision", "model", "baseUrl", "credentialConfigured", "credentialMask", "nativeReady", "message"],
+    required: ["schemaVersion", "revision", "model", "baseUrl", "credentials", "credentialConfigured", "credentialMask", "enabledCredentialCount", "nativeReady", "message"],
     properties: {
-      schemaVersion: { type: "integer", const: 2 }, revision: { type: "integer", minimum: 0 },
+      schemaVersion: { type: "integer", const: 4 }, revision: { type: "integer", minimum: 0 },
       model: { type: "string", maxLength: 128 }, baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" }, credentialConfigured: { type: "boolean" },
       credentialMask: { type: "string", enum: ["", "••••••••"] },
+      enabledCredentialCount: { type: "integer", minimum: 0, maximum: MAX_CREDENTIALS },
+      credentials: {
+        type: "array", maxItems: MAX_CREDENTIALS,
+        items: {
+          type: "object", additionalProperties: false, required: ["id", "label", "baseUrl", "enabled", "priority", "status"],
+          properties: {
+            id: { type: "string", minLength: 1, maxLength: 64 },
+            label: { type: "string", minLength: 1, maxLength: 128 },
+            baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" },
+            enabled: { type: "boolean" }, priority: { type: "integer", minimum: 1, maximum: MAX_CREDENTIALS },
+            status: { type: "string", enum: ["ready", "disabled", "invalid", "exhausted"] },
+          },
+        },
+      },
       nativeReady: { type: "boolean" }, message: { type: "string" },
     },
   };
@@ -171,13 +183,12 @@ const tools = [
     _meta: { ui: { visibility: ["app"] } },
   },
   {
-    name: "deepseek_credential_set", title: "Save DeepSeek connection",
-    description: "Store a DeepSeek API base URL and optionally replace the local API key. Never returns the key.",
+    name: "deepseek_connection_save", title: "Save one DeepSeek connection endpoint",
+    description: "Compatibility tool for older cached settings pages. It changes the endpoint only when exactly one connection is configured.",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["expectedRevision", "baseUrl"],
       properties: {
         expectedRevision: { type: "integer", minimum: 0 },
-        apiKey: { type: "string", minLength: 8, maxLength: 4096, format: "password" },
         baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" },
       },
     },
@@ -186,8 +197,78 @@ const tools = [
     _meta: { ui: { visibility: ["app"] } },
   },
   {
-    name: "deepseek_credential_delete", title: "Delete DeepSeek API key",
-    description: "Delete the API key and native role, then restore the previous provider configuration for new tasks.",
+    name: "deepseek_credential_add", title: "Add DeepSeek connection",
+    description: `Add one labeled API base URL and API key pair to the ordered failover pool. At most ${MAX_CREDENTIALS} connections are allowed. Never returns any key.`,
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["expectedRevision", "label", "baseUrl", "apiKey"],
+      properties: {
+        expectedRevision: { type: "integer", minimum: 0 },
+        label: { type: "string", minLength: 1, maxLength: 128 },
+        baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" },
+        apiKey: { type: "string", minLength: 8, maxLength: 4096, format: "password" },
+      },
+    },
+    outputSchema: settingsOutputSchema(),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  {
+    name: "deepseek_credential_update", title: "Update DeepSeek connection",
+    description: "Update one connection label, API base URL, or enabled state without returning or replacing its secret.",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["expectedRevision", "id", "label", "baseUrl", "enabled"],
+      properties: {
+        expectedRevision: { type: "integer", minimum: 0 }, id: { type: "string", minLength: 1, maxLength: 64 },
+        label: { type: "string", minLength: 1, maxLength: 128 },
+        baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" }, enabled: { type: "boolean" },
+      },
+    },
+    outputSchema: settingsOutputSchema(),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  {
+    name: "deepseek_credential_move", title: "Reorder DeepSeek connection",
+    description: "Move one Base URL + API key connection up or down in the ordered failover pool.",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["expectedRevision", "id", "direction"],
+      properties: {
+        expectedRevision: { type: "integer", minimum: 0 }, id: { type: "string", minLength: 1, maxLength: 64 },
+        direction: { type: "string", enum: ["up", "down"] },
+      },
+    },
+    outputSchema: settingsOutputSchema(),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  {
+    name: "deepseek_credential_remove", title: "Remove one DeepSeek connection",
+    description: "Remove one Base URL + API key connection from the failover pool. Removing the final connection also removes native routing.",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["expectedRevision", "id"],
+      properties: { expectedRevision: { type: "integer", minimum: 0 }, id: { type: "string", minLength: 1, maxLength: 64 } },
+    },
+    outputSchema: settingsOutputSchema(),
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  {
+    name: "deepseek_credential_set", title: "Save one legacy DeepSeek connection",
+    description: "Compatibility tool for older cached settings pages. It only works when zero or one API key is configured.",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["expectedRevision", "baseUrl"],
+      properties: {
+        expectedRevision: { type: "integer", minimum: 0 }, baseUrl: { type: "string", minLength: 1, maxLength: 2048, format: "uri" },
+        apiKey: { type: "string", minLength: 8, maxLength: 4096, format: "password" },
+      },
+    },
+    outputSchema: settingsOutputSchema(),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  {
+    name: "deepseek_credential_delete", title: "Delete all DeepSeek connections",
+    description: "Delete every Base URL + API key connection and the native role, then restore the previous provider configuration for new tasks.",
     inputSchema: {
       type: "object", additionalProperties: false, required: ["expectedRevision"],
       properties: { expectedRevision: { type: "integer", minimum: 0 } },
@@ -223,7 +304,7 @@ function classifiedError(error) {
     [/DeepSeek settings file.*(?:invalid|contains invalid JSON)/i, "SETTINGS_INVALID"],
     [/API base URL/i, "INVALID_BASE_URL"],
     [/API key.*(?:invalid|must be)|Invalid DeepSeek API key/i, "INVALID_API_KEY"],
-    [/not configured|Save an API key and model first/i, "NOT_CONFIGURED"],
+    [/not configured|No enabled DeepSeek (?:API key|connection)|Save (?:an API key|a connection) and model first/i, "NOT_CONFIGURED"],
     [/Select a model|selected model.*(?:not available|no longer available)|Invalid DeepSeek model/i, "MODEL_UNAVAILABLE"],
     [/Settings changed|changed while|busy in another Codex task/i, "SETTINGS_CONFLICT"],
     [/timed out/i, "UPSTREAM_TIMEOUT"],
@@ -257,10 +338,6 @@ function errorResponse(id, code, message) {
   send({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
-function validApiKey(apiKey) {
-  return typeof apiKey === "string" && apiKey === apiKey.trim() && Buffer.byteLength(apiKey, "utf8") >= 8 && Buffer.byteLength(apiKey, "utf8") <= 4096 && !/[\r\n]/.test(apiKey);
-}
-
 function validModelId(model) {
   return typeof model === "string" && MODEL_ID_PATTERN.test(model);
 }
@@ -277,14 +354,16 @@ function parseSettingsSnapshot(snapshot) {
     if (error instanceof SyntaxError) throw new Error("The DeepSeek settings file contains invalid JSON.");
     throw error;
   }
-  const valid = [1, 2].includes(parsed?.schemaVersion) && Number.isInteger(parsed.revision) && parsed.revision >= 0 &&
-    (parsed.model === "" || validModelId(parsed.model)) && (parsed.apiKey == null || validApiKey(parsed.apiKey)) &&
+  const valid = parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
+    (parsed.model === "" || validModelId(parsed.model)) &&
     (parsed.baseUrl === undefined || typeof parsed.baseUrl === "string");
   if (!valid) throw new Error("The DeepSeek settings file is invalid. Delete it and save settings again.");
-  let baseUrl;
-  try { baseUrl = normalizeApiBaseUrl(parsed.baseUrl === undefined ? DEFAULT_DEEPSEEK_BASE_URL : parsed.baseUrl); }
-  catch { throw new Error("The DeepSeek settings file contains an invalid API base URL. Delete it and save settings again."); }
-  return { schemaVersion: 2, revision: parsed.revision, model: parsed.model || "", apiKey: parsed.apiKey || null, baseUrl };
+  let credentials;
+  try { credentials = credentialsFromSettingsDocument(parsed, { defaultBaseUrl: DEFAULT_DEEPSEEK_BASE_URL }); }
+  catch { throw new Error("The DeepSeek settings file contains an invalid credential pool. Delete it and save settings again."); }
+  const baseUrl = credentials.find((credential) => credential.enabled)?.baseUrl || credentials[0]?.baseUrl ||
+    normalizeApiBaseUrl(parsed.baseUrl === undefined ? DEFAULT_DEEPSEEK_BASE_URL : parsed.baseUrl);
+  return { schemaVersion: 4, revision: parsed.revision, model: parsed.model || "", credentials, baseUrl };
 }
 
 async function readSettings() {
@@ -392,39 +471,49 @@ async function writeSettings(expectedRevision, patch) {
   const snapshot = await settingsFileSnapshot();
   const current = parseSettingsSnapshot(snapshot);
   if (current.revision !== expectedRevision) throw new Error("Settings changed in another window. Reload and try again.");
-  const next = { ...current, ...patch, schemaVersion: 2, revision: current.revision + 1 };
+  const next = { ...current, ...patch, schemaVersion: 4, revision: current.revision + 1 };
   if (next.model !== "" && !validModelId(next.model)) throw new Error("Invalid DeepSeek model ID.");
-  if (next.apiKey !== null && !validApiKey(next.apiKey)) throw new Error("Invalid DeepSeek API key.");
-  next.baseUrl = normalizeApiBaseUrl(next.baseUrl);
-  const contents = `${JSON.stringify(next, null, 2)}\n`;
+  next.credentials = credentialsFromSettings(next);
+  next.baseUrl = next.credentials.find((credential) => credential.enabled)?.baseUrl || next.credentials[0]?.baseUrl || DEFAULT_DEEPSEEK_BASE_URL;
+  const canonical = {
+    schemaVersion: 4,
+    revision: next.revision,
+    model: next.model,
+    credentials: next.credentials,
+  };
+  const contents = `${JSON.stringify(canonical, null, 2)}\n`;
   await atomicWriteSettings(contents, 0o600, snapshot);
   return { settings: next, contents };
 }
 
 async function getConnectionSettings() {
   const settings = await readSettings();
-  if (!validApiKey(settings.apiKey)) throw new Error("DeepSeek API key is not configured. Open Settings → Integrations → DeepSeek Subagent.");
+  if (!enabledCredentials(settings).length) throw new Error("No enabled DeepSeek connection is configured. Open Settings → Integrations → DeepSeek Subagent.");
   return settings;
 }
 
 async function ensureNative(settings, models = []) {
-  if (!validApiKey(settings.apiKey) || !settings.model) return nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
+  if (!enabledCredentials(settings).length || !settings.model) return nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
   await installNativeIntegration({
     settingsDir: SETTINGS_DIR, settingsFile: SETTINGS_FILE, model: settings.model,
     models: models.length ? models : [{ id: settings.model }], modelTemplateFile: MODEL_TEMPLATE,
     apiBaseUrl: settings.baseUrl,
   });
+  settingsCredentialPool.sync(settings.revision);
+  for (const [credentialId, state] of settingsCredentialPool.statuses(credentialsFromSettings(settings))) {
+    await propagateCredentialFailure(settings, credentialId, state.status);
+  }
   return nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
 }
 
 async function recoverConfiguredNative() {
   const observed = await readSettings();
-  if (!validApiKey(observed.apiKey) || !observed.model) return { ready: false, skipped: true };
+  if (!enabledCredentials(observed).length || !observed.model) return { ready: false, skipped: true };
   const existing = await nativeIntegrationStatus(SETTINGS_DIR, observed.model, observed.baseUrl);
   if (existing.ready) return existing;
   return queueSettingsMutation(async () => {
     const current = await readSettings();
-    if (current.revision !== observed.revision || current.model !== observed.model || current.apiKey !== observed.apiKey || current.baseUrl !== observed.baseUrl) {
+    if (current.revision !== observed.revision || current.model !== observed.model || current.baseUrl !== observed.baseUrl) {
       return { ready: false, skipped: true };
     }
     const latest = await nativeIntegrationStatus(SETTINGS_DIR, current.model, current.baseUrl);
@@ -434,54 +523,119 @@ async function recoverConfiguredNative() {
   });
 }
 
+async function credentialRuntimeStatuses(settings) {
+  try {
+    const runtime = JSON.parse(await readFile(nativePaths(SETTINGS_DIR).runtimeFile, "utf8"));
+    if (!Number.isInteger(runtime?.port) || runtime.port < 1024 || runtime.port > 65535 ||
+        !/^[a-f0-9]{48}$/.test(runtime?.routeToken || "") || !/^[a-f0-9]{48}$/.test(runtime?.instanceId || "")) return new Map();
+    const response = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/healthz`, { signal: AbortSignal.timeout(500) });
+    if (!response.ok) return new Map();
+    const payload = await response.json();
+    if (payload?.instanceId !== runtime.instanceId || !Array.isArray(payload?.credentials) || payload.credentials.length > MAX_CREDENTIALS) return new Map();
+    const configuredIds = new Set(credentialsFromSettings(settings).map((credential) => credential.id));
+    const statuses = new Map();
+    for (const credential of payload.credentials) {
+      if (!configuredIds.has(credential?.id) || !["ready", "disabled", "invalid", "exhausted"].includes(credential?.status)) return new Map();
+      statuses.set(credential.id, { status: credential.status });
+    }
+    return statuses;
+  } catch {
+    return new Map();
+  }
+}
+
+async function propagateCredentialFailure(settings, credentialId, reason) {
+  try {
+    const runtime = JSON.parse(await readFile(nativePaths(SETTINGS_DIR).runtimeFile, "utf8"));
+    if (!Number.isInteger(runtime?.port) || runtime.port < 1024 || runtime.port > 65535 ||
+        !/^[a-f0-9]{48}$/.test(runtime?.routeToken || "") || !/^[a-f0-9]{48}$/.test(runtime?.shutdownToken || "")) return;
+    await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/control/credential-failure`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${runtime.shutdownToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ revision: settings.revision, id: credentialId, reason }),
+      signal: AbortSignal.timeout(500),
+    });
+  } catch {}
+}
+
 async function settingsSnapshot(message, source = null) {
   const settings = source || await readSettings();
-  const configured = validApiKey(settings.apiKey);
+  const credentials = credentialsFromSettings(settings);
+  const enabledCount = credentials.filter((credential) => credential.enabled).length;
+  const configured = credentials.length > 0;
   const native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
+  settingsCredentialPool.sync(settings.revision);
+  let runtimeStatuses = settingsCredentialPool.statuses(credentials);
+  if (native.ready) {
+    runtimeStatuses = mergeCredentialStatuses(runtimeStatuses, await credentialRuntimeStatuses(settings));
+  }
   return {
-    schemaVersion: 2, revision: settings.revision, model: settings.model, baseUrl: settings.baseUrl,
+    schemaVersion: 4, revision: settings.revision, model: settings.model, baseUrl: settings.baseUrl,
+    credentials: publicCredentials(settings, runtimeStatuses), enabledCredentialCount: enabledCount,
     credentialConfigured: configured, credentialMask: configured ? "••••••••" : "",
-    nativeReady: native.ready, message,
+    nativeReady: enabledCount > 0 && native.ready, message,
   };
 }
 
 async function fetchModels({ force = false } = {}) {
   const connection = await getConnectionSettings();
-  let apiKey = connection.apiKey;
-  const baseUrl = connection.baseUrl;
-  const fingerprint = createHash("sha256").update(apiKey).update("\0").update(baseUrl).digest("hex");
+  const credentials = enabledCredentials(connection);
+  const fingerprintHash = createHash("sha256");
+  for (const credential of credentials) {
+    fingerprintHash.update("\0").update(credential.id).update("\0").update(credential.baseUrl).update("\0").update(credential.apiKey);
+  }
+  const fingerprint = fingerprintHash.digest("hex");
   if (!force && modelsCache?.fingerprint === fingerprint && Date.now() - modelsCache.fetchedAt < MODELS_CACHE_MS) {
-    apiKey = "";
     return modelsCache.models.map((model) => ({ ...model }));
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
-  let response;
+  settingsCredentialPool.sync(connection.revision);
+  const sharedStatuses = await credentialRuntimeStatuses(connection);
+  const candidates = settingsCredentialPool.candidates(credentials).filter((credential) =>
+    !["invalid", "exhausted"].includes(sharedStatuses.get(credential.id)?.status));
+  if (!candidates.length) throw new Error("No enabled DeepSeek connection is currently available.");
+  const modelMaps = [];
+  let lastFailureStatus = 0;
   try {
-    response = await fetch(new URL("models", baseUrl), {
-      method: "GET", headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" }, signal: controller.signal,
-    });
+    for (const credential of candidates) {
+      const response = await fetch(new URL("models", credential.baseUrl), {
+        method: "GET", headers: { authorization: `Bearer ${credential.apiKey}`, accept: "application/json" }, signal: controller.signal,
+      });
+      const reason = failoverReason(response.status);
+      if (reason) {
+        lastFailureStatus = response.status;
+        settingsCredentialPool.markFailure(credential.id, reason);
+        await propagateCredentialFailure(connection, credential.id, reason);
+        try { await response.body?.cancel(); } catch {}
+        continue;
+      }
+      if (!response.ok) throw new Error(`DeepSeek GET /v1/models returned HTTP ${response.status}.`);
+      let payload;
+      try { payload = await response.json(); }
+      catch { throw new Error("DeepSeek GET /v1/models returned invalid JSON."); }
+      if (!Array.isArray(payload?.data)) throw new Error("DeepSeek GET /v1/models returned an invalid model list.");
+      const models = new Map();
+      for (const item of payload.data) {
+        if (validModelId(item?.id) && !models.has(item.id)) {
+          models.set(item.id, { id: item.id, ...(typeof item.owned_by === "string" ? { ownedBy: item.owned_by } : {}) });
+        }
+      }
+      for (const id of RESPONSES_MODELS_NOT_LISTED_BY_API) {
+        if (!models.has(id)) models.set(id, { id, ownedBy: "deepseek" });
+      }
+      if (!models.size) throw new Error("DeepSeek GET /v1/models returned no valid model IDs.");
+      settingsCredentialPool.markSuccess(credential.id);
+      modelMaps.push(models);
+    }
   } catch (error) {
     if (error?.name === "AbortError") throw new Error("DeepSeek model request timed out after 30 seconds.");
+    if (error instanceof Error && /DeepSeek GET \/v1\/models/.test(error.message)) throw error;
     throw new Error("Unable to reach DeepSeek GET /v1/models.");
-  } finally { clearTimeout(timer); apiKey = ""; }
-  if (!response.ok) throw new Error(`DeepSeek GET /v1/models returned HTTP ${response.status}.`);
-  let payload;
-  try { payload = await response.json(); }
-  catch { throw new Error("DeepSeek GET /v1/models returned invalid JSON."); }
-  const seen = new Set();
-  if (!Array.isArray(payload?.data)) throw new Error("DeepSeek GET /v1/models returned an invalid model list.");
-  const models = payload.data.flatMap((item) => {
-    if (!validModelId(item?.id) || seen.has(item.id)) return [];
-    seen.add(item.id);
-    return [{ id: item.id, ...(typeof item.owned_by === "string" ? { ownedBy: item.owned_by } : {}) }];
-  });
-  for (const id of RESPONSES_MODELS_NOT_LISTED_BY_API) {
-    if (!seen.has(id)) {
-      seen.add(id);
-      models.push({ id, ownedBy: "deepseek" });
-    }
-  }
+  } finally { clearTimeout(timer); }
+  if (!modelMaps.length) throw new Error(`DeepSeek GET /v1/models returned HTTP ${lastFailureStatus || 401}.`);
+  const [first, ...rest] = modelMaps;
+  const models = [...first.values()].filter((model) => rest.every((candidate) => candidate.has(model.id)));
   if (!models.length) throw new Error("DeepSeek GET /v1/models returned no valid model IDs.");
   modelsCache = { fingerprint, fetchedAt: Date.now(), models };
   return models.map((model) => ({ ...model }));
@@ -489,27 +643,46 @@ async function fetchModels({ force = false } = {}) {
 
 async function probeResponses(model) {
   const connection = await getConnectionSettings();
-  let apiKey = connection.apiKey;
-  const baseUrl = connection.baseUrl;
+  const credentials = enabledCredentials(connection);
+  settingsCredentialPool.sync(connection.revision);
+  const sharedStatuses = await credentialRuntimeStatuses(connection);
+  const candidates = settingsCredentialPool.candidates(credentials).filter((credential) =>
+    !["invalid", "exhausted"].includes(sharedStatuses.get(credential.id)?.status));
+  if (!candidates.length) throw new Error("No enabled DeepSeek connection is currently available.");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
-  let response;
+  let successful = 0;
+  let lastFailureStatus = 0;
   try {
-    response = await fetch(new URL("responses", baseUrl), {
-      method: "POST",
-      headers: { authorization: `Bearer ${apiKey}`, accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify({ model, input: "Reply with OK.", max_output_tokens: 8, stream: false }),
-      signal: controller.signal,
-    });
+    for (const credential of candidates) {
+      const response = await fetch(new URL("responses", credential.baseUrl), {
+        method: "POST",
+        headers: { authorization: `Bearer ${credential.apiKey}`, accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({ model, input: "Reply with OK.", max_output_tokens: 8, stream: false }),
+        signal: controller.signal,
+      });
+      const reason = failoverReason(response.status);
+      if (reason) {
+        lastFailureStatus = response.status;
+        settingsCredentialPool.markFailure(credential.id, reason);
+        await propagateCredentialFailure(connection, credential.id, reason);
+        try { await response.body?.cancel(); } catch {}
+        continue;
+      }
+      if (!response.ok) throw new Error(`DeepSeek POST /v1/responses returned HTTP ${response.status} for ${model}.`);
+      let payload;
+      try { payload = await response.json(); }
+      catch { throw new Error("DeepSeek POST /v1/responses returned invalid JSON."); }
+      if (!payload || typeof payload !== "object") throw new Error("DeepSeek POST /v1/responses returned an invalid response.");
+      settingsCredentialPool.markSuccess(credential.id);
+      successful++;
+    }
   } catch (error) {
     if (error?.name === "AbortError") throw new Error("DeepSeek Responses request timed out after 30 seconds.");
+    if (error instanceof Error && /DeepSeek POST \/v1\/responses/.test(error.message)) throw error;
     throw new Error("Unable to reach DeepSeek POST /v1/responses.");
-  } finally { clearTimeout(timer); apiKey = ""; }
-  if (!response.ok) throw new Error(`DeepSeek POST /v1/responses returned HTTP ${response.status} for ${model}.`);
-  let payload;
-  try { payload = await response.json(); }
-  catch { throw new Error("DeepSeek POST /v1/responses returned invalid JSON."); }
-  if (!payload || typeof payload !== "object") throw new Error("DeepSeek POST /v1/responses returned an invalid response.");
+  } finally { clearTimeout(timer); }
+  if (!successful) throw new Error(`DeepSeek POST /v1/responses returned HTTP ${lastFailureStatus || 401} for ${model}.`);
 }
 
 async function saveModel(expectedRevision, model) {
@@ -540,14 +713,14 @@ async function prepareNativeDelegation(args) {
     throw new Error("Spawn taskName must start with a lowercase letter and contain at most 32 lowercase letters, digits, or underscores.");
   }
   const settings = await readSettings();
-  if (!validApiKey(settings.apiKey) || !settings.model) {
-    throw new Error("DeepSeek native delegation is not configured. Save an API key and model first.");
+  if (!enabledCredentials(settings).length || !settings.model) {
+    throw new Error("DeepSeek native delegation is not configured. Enable a connection and save a model first.");
   }
   let native = await nativeIntegrationStatus(SETTINGS_DIR, settings.model, settings.baseUrl);
   if (!native.ready) {
     native = await queueSettingsMutation(async () => {
       const current = await readSettings();
-      if (current.revision !== settings.revision || current.model !== settings.model || current.apiKey !== settings.apiKey || current.baseUrl !== settings.baseUrl) {
+      if (current.revision !== settings.revision || current.model !== settings.model || current.baseUrl !== settings.baseUrl) {
         throw new Error("DeepSeek settings changed while the native router was being recovered. Retry the delegation.");
       }
       await ensureNative(current);
@@ -606,6 +779,152 @@ async function callTool(name, args) {
     const prepared = await prepareNativeDelegation(args);
     return resultText("Native DeepSeek delegation prepared in loopback memory.", prepared);
   }
+  case "deepseek_connection_save": {
+    const baseUrl = normalizeApiBaseUrl(args?.baseUrl);
+    return queueSettingsMutation(async () => {
+      modelsCache = null;
+      const snapshot = await settingsFileSnapshot();
+      const current = parseSettingsSnapshot(snapshot);
+      const credentials = credentialsFromSettings(current);
+      if (credentials.length !== 1) throw new Error("This cached settings page cannot edit a connection pool. Reopen DeepSeek Subagent settings.");
+      const baseUrlChanged = credentials[0].baseUrl !== baseUrl;
+      if (baseUrlChanged && current.model) await validateLegacyCredentialHelper(SETTINGS_DIR);
+      if (baseUrlChanged) {
+        const previous = credentials[0];
+        credentials[0] = createCredential([], previous.label, baseUrl, previous.apiKey, previous.enabled, { reservedIds: [previous.id] });
+      }
+      const written = await writeSettings(args?.expectedRevision, {
+        credentials,
+        ...(baseUrlChanged && current.model ? { model: "" } : {}),
+      });
+      try {
+        if (baseUrlChanged && current.model) await removeNativeIntegration(SETTINGS_DIR);
+        const message = baseUrlChanged && current.model
+          ? "API base URL saved. Refresh and save a model again to activate the new route."
+          : "API base URL saved.";
+        return resultText("DeepSeek API base URL saved.", await settingsSnapshot(message, written.settings));
+      } catch (error) {
+        await restoreSettingsSnapshot(snapshot, written.contents).catch((rollbackError) => {
+          throw new AggregateError([error, rollbackError], "Connection save failed and settings rollback was incomplete.");
+        });
+        throw error;
+      }
+    });
+  }
+  case "deepseek_credential_add": {
+    if (!validApiKey(args?.apiKey)) throw new Error("API key must be 8–4096 UTF-8 bytes with no leading/trailing whitespace or newline.");
+    const label = normalizeCredentialLabel(args?.label);
+    const baseUrl = normalizeApiBaseUrl(args?.baseUrl);
+    return queueSettingsMutation(async () => {
+      modelsCache = null;
+      const snapshot = await settingsFileSnapshot();
+      const current = parseSettingsSnapshot(snapshot);
+      const credentials = credentialsFromSettings(current);
+      credentials.push(createCredential(credentials, label, baseUrl, args.apiKey));
+      if (current.model) await validateLegacyCredentialHelper(SETTINGS_DIR);
+      const written = await writeSettings(args?.expectedRevision, { credentials, ...(current.model ? { model: "" } : {}) });
+      try {
+        if (current.model) await removeNativeIntegration(SETTINGS_DIR);
+        const message = current.model
+          ? "Connection added. Refresh and save a model again to validate every enabled endpoint."
+          : "Connection added to the failover pool.";
+        return resultText("DeepSeek connection added.", await settingsSnapshot(message, written.settings));
+      } catch (error) {
+        await restoreSettingsSnapshot(snapshot, written.contents).catch((rollbackError) => {
+          throw new AggregateError([error, rollbackError], "Credential add failed and settings rollback was incomplete.");
+        });
+        throw error;
+      }
+    });
+  }
+  case "deepseek_credential_update": {
+    if (!validCredentialId(args?.id)) throw new Error("Invalid DeepSeek credential ID.");
+    const label = normalizeCredentialLabel(args?.label);
+    const baseUrl = normalizeApiBaseUrl(args?.baseUrl);
+    if (typeof args?.enabled !== "boolean") throw new Error("Credential enabled state must be a boolean.");
+    return queueSettingsMutation(async () => {
+      modelsCache = null;
+      const snapshot = await settingsFileSnapshot();
+      const current = parseSettingsSnapshot(snapshot);
+      const credentials = credentialsFromSettings(current);
+      const index = credentials.findIndex((credential) => credential.id === args.id);
+      if (index < 0) throw new Error("DeepSeek credential no longer exists. Reload and try again.");
+      const beforeEnabled = enabledCredentials(current).length;
+      const previous = credentials[index];
+      const requiresRevalidation = Boolean(current.model) && previous.baseUrl !== baseUrl;
+      const baseUrlChanged = previous.baseUrl !== baseUrl;
+      credentials[index] = baseUrlChanged
+        ? createCredential(
+          credentials.filter((_credential, candidateIndex) => candidateIndex !== index),
+          label,
+          baseUrl,
+          previous.apiKey,
+          args.enabled,
+          { reservedIds: [previous.id] },
+        )
+        : { ...previous, label, enabled: args.enabled };
+      const afterEnabled = credentials.filter((credential) => credential.enabled).length;
+      const mustRemoveNative = Boolean(current.model) && (requiresRevalidation || (beforeEnabled > 0 && afterEnabled === 0));
+      if (mustRemoveNative) await validateLegacyCredentialHelper(SETTINGS_DIR);
+      const written = await writeSettings(args?.expectedRevision, { credentials, ...(requiresRevalidation ? { model: "" } : {}) });
+      try {
+        if (mustRemoveNative) await removeNativeIntegration(SETTINGS_DIR);
+        else if (beforeEnabled === 0 && afterEnabled > 0 && current.model) await ensureNative(written.settings);
+        const message = requiresRevalidation
+          ? "Connection updated. Refresh and save a model again to validate every enabled endpoint."
+          : "Connection settings updated.";
+        return resultText("DeepSeek connection settings updated.", await settingsSnapshot(message, written.settings));
+      } catch (error) {
+        await restoreSettingsSnapshot(snapshot, written.contents).catch((rollbackError) => {
+          throw new AggregateError([error, rollbackError], "Credential update failed and settings rollback was incomplete.");
+        });
+        throw error;
+      }
+    });
+  }
+  case "deepseek_credential_move": {
+    if (!validCredentialId(args?.id) || !["up", "down"].includes(args?.direction)) throw new Error("Invalid credential reorder request.");
+    return queueSettingsMutation(async () => {
+      modelsCache = null;
+      const current = await readSettings();
+      const credentials = credentialsFromSettings(current);
+      const index = credentials.findIndex((credential) => credential.id === args.id);
+      if (index < 0) throw new Error("DeepSeek credential no longer exists. Reload and try again.");
+      const target = args.direction === "up" ? index - 1 : index + 1;
+      if (target < 0 || target >= credentials.length) throw new Error("DeepSeek credential is already at that edge of the failover order.");
+      [credentials[index], credentials[target]] = [credentials[target], credentials[index]];
+      const written = await writeSettings(args?.expectedRevision, { credentials });
+      return resultText("DeepSeek connection order updated.", await settingsSnapshot("Failover order updated.", written.settings));
+    });
+  }
+  case "deepseek_credential_remove": {
+    if (!validCredentialId(args?.id)) throw new Error("Invalid DeepSeek credential ID.");
+    return queueSettingsMutation(async () => {
+      modelsCache = null;
+      const snapshot = await settingsFileSnapshot();
+      const current = parseSettingsSnapshot(snapshot);
+      const credentials = credentialsFromSettings(current);
+      const index = credentials.findIndex((credential) => credential.id === args.id);
+      if (index < 0) throw new Error("DeepSeek credential no longer exists. Reload and try again.");
+      credentials.splice(index, 1);
+      const afterEnabled = credentials.filter((credential) => credential.enabled).length;
+      const mustRemoveNative = enabledCredentials(current).length > 0 && afterEnabled === 0 && Boolean(current.model);
+      if (mustRemoveNative) await validateLegacyCredentialHelper(SETTINGS_DIR);
+      const written = await writeSettings(args?.expectedRevision, { credentials, ...(credentials.length === 0 ? { model: "" } : {}) });
+      try {
+        if (mustRemoveNative) await removeNativeIntegration(SETTINGS_DIR);
+        const message = credentials.length === 0
+          ? "Final connection removed; model selection and native routing were cleared."
+          : "Connection removed from the failover pool.";
+        return resultText("DeepSeek connection removed.", await settingsSnapshot(message, written.settings));
+      } catch (error) {
+        await restoreSettingsSnapshot(snapshot, written.contents).catch((rollbackError) => {
+          throw new AggregateError([error, rollbackError], "Credential removal failed and settings rollback was incomplete.");
+        });
+        throw error;
+      }
+    });
+  }
   case "deepseek_credential_set": {
     const baseUrl = normalizeApiBaseUrl(args?.baseUrl);
     if (args?.apiKey !== undefined && !validApiKey(args.apiKey)) throw new Error("API key must be 8–4096 UTF-8 bytes with no leading/trailing whitespace or newline.");
@@ -613,14 +932,25 @@ async function callTool(name, args) {
       modelsCache = null;
       const snapshot = await settingsFileSnapshot();
       const current = parseSettingsSnapshot(snapshot);
-      const apiKey = args?.apiKey === undefined ? current.apiKey : args.apiKey;
-      if (!validApiKey(apiKey)) throw new Error("API key must be provided when DeepSeek has not been configured yet.");
-      const baseUrlChanged = current.baseUrl !== baseUrl;
-      if (baseUrlChanged && current.model) await validateLegacyCredentialHelper(SETTINGS_DIR);
-      const written = await writeSettings(args?.expectedRevision, { apiKey, baseUrl, ...(baseUrlChanged ? { model: "" } : {}) });
+      const credentials = credentialsFromSettings(current);
+      if (credentials.length > 1) throw new Error("This cached settings page cannot replace a multi-key pool. Reopen DeepSeek Subagent settings.");
+      if (credentials.length === 0 && args?.apiKey === undefined) throw new Error("API key must be provided when DeepSeek has not been configured yet.");
+      const replacement = credentials.length === 0
+        ? createCredential([], "Primary", baseUrl, args.apiKey)
+        : args?.apiKey === undefined
+          ? credentials[0].baseUrl === baseUrl
+            ? credentials[0]
+            : createCredential([], credentials[0].label, baseUrl, credentials[0].apiKey, credentials[0].enabled, { reservedIds: [credentials[0].id] })
+          : createCredential([], credentials[0].label, baseUrl, args.apiKey, true, { reservedIds: [credentials[0].id] });
+      const beforeEnabled = enabledCredentials(current).length;
+      const afterEnabled = replacement.enabled ? 1 : 0;
+      const connectionChanged = credentials.length === 0 || credentials[0].baseUrl !== baseUrl || args?.apiKey !== undefined;
+      if (connectionChanged && current.model) await validateLegacyCredentialHelper(SETTINGS_DIR);
+      const written = await writeSettings(args?.expectedRevision, { credentials: [replacement], ...(connectionChanged ? { model: "" } : {}) });
       try {
-        if (baseUrlChanged && current.model) await removeNativeIntegration(SETTINGS_DIR);
-        const message = baseUrlChanged && current.model
+        if (connectionChanged && current.model) await removeNativeIntegration(SETTINGS_DIR);
+        else if (beforeEnabled === 0 && afterEnabled > 0 && current.model) await ensureNative(written.settings);
+        const message = connectionChanged && current.model
           ? "Connection saved. Refresh and save a model again to activate the new API base URL."
           : "Connection saved.";
         return resultText("DeepSeek connection saved.", await settingsSnapshot(message, written.settings));
@@ -637,10 +967,10 @@ async function callTool(name, args) {
       await validateLegacyCredentialHelper(SETTINGS_DIR);
       modelsCache = null;
       const snapshot = await settingsFileSnapshot();
-      const written = await writeSettings(args?.expectedRevision, { apiKey: null, model: "" });
+      const written = await writeSettings(args?.expectedRevision, { credentials: [], model: "" });
       try {
         await removeNativeIntegration(SETTINGS_DIR);
-        return resultText("DeepSeek API key, native role, and provider routing were removed.", await settingsSnapshot("API key deleted and routing disabled for new tasks.", written.settings));
+        return resultText("DeepSeek connections, native role, and provider routing were removed.", await settingsSnapshot("All connections deleted and routing disabled for new tasks.", written.settings));
       } catch (error) {
         await restoreSettingsSnapshot(snapshot, written.contents).catch((rollbackError) => {
           throw new AggregateError([error, rollbackError], "Credential deletion failed and settings rollback was incomplete.");

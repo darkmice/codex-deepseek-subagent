@@ -3,6 +3,7 @@ import { lstat, readFile, rm, rmdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { removeNativeCleanupSupport, removeNativeIntegration, validateLegacyCredentialHelper, withNativeMutationLock } from "./native-config.mjs";
+import { credentialsFromSettingsDocument, DEFAULT_DEEPSEEK_BASE_URL } from "./credential-pool.mjs";
 
 const settingsDir = dirname(fileURLToPath(import.meta.url));
 const settingsFile = join(settingsDir, "settings.json");
@@ -11,6 +12,7 @@ const managedScripts = [
   fileURLToPath(import.meta.url),
   join(settingsDir, "native-config.mjs"),
   join(settingsDir, "runtime.mjs"),
+  join(settingsDir, "credential-pool.mjs"),
 ];
 
 async function validateOwnedRegularFile(path, { settings = false, managedScript = false } = {}) {
@@ -21,10 +23,8 @@ async function validateOwnedRegularFile(path, { settings = false, managedScript 
     }
     if (settings) {
       const value = JSON.parse(await readFile(path, "utf8"));
-      if (![1, 2].includes(value?.schemaVersion) || !Number.isInteger(value?.revision) || value.revision < 0 ||
-          typeof value?.model !== "string" || !(value.apiKey === null || typeof value.apiKey === "string")) {
-        throw new Error(`Refusing to delete an unrecognized DeepSeek settings file: ${path}`);
-      }
+      try { credentialsFromSettingsDocument(value, { defaultBaseUrl: DEFAULT_DEEPSEEK_BASE_URL }); }
+      catch { throw new Error(`Refusing to delete an unrecognized DeepSeek settings file: ${path}`); }
     }
     if (managedScript && !/^\/\/ Managed by the DeepSeek Subagent Codex plugin\.\r?\n/.test(await readFile(path, "utf8"))) {
       throw new Error(`Refusing to delete an unmanaged DeepSeek cleanup support file: ${path}`);

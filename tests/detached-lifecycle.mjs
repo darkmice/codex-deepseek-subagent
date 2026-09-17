@@ -144,6 +144,7 @@ wire_api = "responses"
     await mkdir(settingsDir, { recursive: true });
     await mkdir(codexHome, { recursive: true });
     await writeFile(paths.runtimeModuleFile, await readFile(join(root, "plugins/deepseek-subagent/scripts/runtime.mjs"), "utf8"));
+    await writeFile(join(settingsDir, "credential-pool.mjs"), await readFile(join(root, "plugins/deepseek-subagent/scripts/credential-pool.mjs"), "utf8"));
     await writeFile(settingsFile, `${JSON.stringify({ schemaVersion: 2, revision: 1, model: "deepseek-flash", apiKey: "test-only-key" })}\n`);
     await writeFile(paths.codexConfig, originalConfig);
 

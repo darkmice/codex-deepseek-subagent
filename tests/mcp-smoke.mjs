@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { LEGACY_NATIVE_CREDENTIAL_SOURCE } from "../plugins/deepseek-subagent/scripts/native-config.mjs";
+import { LEGACY_NATIVE_CREDENTIAL_SOURCE, LEGACY_NATIVE_CREDENTIAL_SOURCE_V1 } from "../plugins/deepseek-subagent/scripts/native-config.mjs";
 import { removeRuntimeRouter, runtimePaths } from "../plugins/deepseek-subagent/scripts/runtime.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -107,8 +107,8 @@ try {
   assert(!JSON.stringify(listed).includes("deepseek-mock-a"));
   assert(!JSON.stringify(listed).includes("deepseek-chat"));
   const resources = (await rpc("resources/list")).result.resources;
-  assert.equal(resources[0].uri, "ui://deepseek-subagent/settings/v5.html");
-  for (const uri of ["ui://deepseek-subagent/settings/v1.html", "ui://deepseek-subagent/settings/v2.html", "ui://deepseek-subagent/settings/v3.html", "ui://deepseek-subagent/settings/v4.html", "ui://deepseek-subagent/settings/v5.html"]) {
+  assert.equal(resources[0].uri, "ui://deepseek-subagent/settings/v7.html");
+  for (const uri of ["ui://deepseek-subagent/settings/v1.html", "ui://deepseek-subagent/settings/v2.html", "ui://deepseek-subagent/settings/v3.html", "ui://deepseek-subagent/settings/v4.html", "ui://deepseek-subagent/settings/v5.html", "ui://deepseek-subagent/settings/v6.html", "ui://deepseek-subagent/settings/v7.html"]) {
     const read = await rpc("resources/read", { uri });
     assert.equal(read.result.contents[0].uri, uri);
     assert(read.result.contents[0].text.includes("ui/initialize"));
@@ -134,16 +134,22 @@ try {
   assert.equal(concurrentWrites.filter((message) => message.result?.isError).length, 1);
   result = concurrentWrites.find((message) => !message.result?.isError).result;
   assert.equal(result.structuredContent.credentialMask, "••••••••");
+  assert.equal(result.structuredContent.schemaVersion, 4);
+  assert.equal(result.structuredContent.enabledCredentialCount, 1);
+  assert.equal(result.structuredContent.credentials.length, 1);
+  let primaryCredentialId = result.structuredContent.credentials[0].id;
   assert.equal(result.structuredContent.baseUrl, firstBaseUrl);
   assert(!JSON.stringify(result).includes(fakeKey));
   result = (await rpc("tools/call", { name: "deepseek_models_list", arguments: { force: true } })).result;
   assert.deepEqual(result.structuredContent.models.map((model) => model.id), ["deepseek-mock-a", "deepseek-mock-b", "deepseek-flash"]);
   assert.equal(modelRequestPaths.at(-1), "/proxy-a/deepseek/v1/models");
   result = (await rpc("tools/call", { name: "deepseek_credential_set", arguments: { expectedRevision: 1, baseUrl: secondBaseUrl } })).result;
-  assert.equal(result.isError, undefined);
+  assert.equal(result.isError, undefined, JSON.stringify(result));
   assert.equal(result.structuredContent.revision, 2);
   assert.equal(result.structuredContent.baseUrl, secondBaseUrl);
   assert.equal(result.structuredContent.credentialConfigured, true, "Changing Base URL without re-entering the key did not preserve the stored credential.");
+  assert.notEqual(result.structuredContent.credentials[0].id, primaryCredentialId, "Changing Base URL retained a connection ID that may be pinned by an active task.");
+  primaryCredentialId = result.structuredContent.credentials[0].id;
   result = (await rpc("tools/call", { name: "deepseek_models_list", arguments: { force: false } })).result;
   assert.equal(result.isError, undefined);
   assert.equal(modelRequestPaths.at(-1), "/proxy-b/deepseek/v1/models", "Changing Base URL reused the old endpoint's model cache.");
@@ -161,7 +167,7 @@ try {
   const configPath = join(codexHome, "config.toml");
   const linkedConfig = join(codexHome, "linked-config.toml");
   const legacyCredentialHelper = join(temp, "native-credential.mjs");
-  await writeFile(legacyCredentialHelper, LEGACY_NATIVE_CREDENTIAL_SOURCE, { mode: 0o600 });
+  await writeFile(legacyCredentialHelper, LEGACY_NATIVE_CREDENTIAL_SOURCE_V1, { mode: 0o600 });
   await writeFile(linkedConfig, originalCodexConfig);
   await rm(configPath);
   if (process.platform === "win32") await link(linkedConfig, configPath);
@@ -169,9 +175,9 @@ try {
   result = (await rpc("tools/call", { name: "deepseek_settings_save", arguments: { expectedRevision: 2, model: "deepseek-mock-a" } })).result;
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /non-regular or multiply linked Codex config/);
-  assert.equal(await readFile(legacyCredentialHelper, "utf8"), LEGACY_NATIVE_CREDENTIAL_SOURCE, "Failed install migration did not restore the legacy credential helper.");
+  assert.equal(await readFile(legacyCredentialHelper, "utf8"), LEGACY_NATIVE_CREDENTIAL_SOURCE_V1, "Failed install migration did not restore the legacy credential helper.");
   assert.deepEqual(JSON.parse(await readFile(join(temp, "settings.json"), "utf8")), {
-    schemaVersion: 2, revision: 2, model: "", apiKey: fakeKey, baseUrl: secondBaseUrl,
+    schemaVersion: 4, revision: 2, model: "", credentials: [{ id: primaryCredentialId, label: "Primary", enabled: true, baseUrl: secondBaseUrl, apiKey: fakeKey }],
   });
   await assertRejectsMissing(join(codexHome, "agents", "deepseek-subagent.toml"));
   await assertRejectsMissing(join(temp, "native-models.json"));
@@ -253,14 +259,14 @@ try {
   assert.equal(settingsIdentityAfterRejectedDelete.mtimeMs, settingsIdentityBeforeRejectedDelete.mtimeMs, "Rejected helper ownership rewrote the settings file.");
   assert.equal(await readFile(legacyCredentialHelper, "utf8"), `${LEGACY_NATIVE_CREDENTIAL_SOURCE}# unrecognized\n`);
   assert.deepEqual(JSON.parse(await readFile(join(temp, "settings.json"), "utf8")), {
-    schemaVersion: 2, revision: 3, model: "deepseek-mock-a", apiKey: fakeKey, baseUrl: secondBaseUrl,
+    schemaVersion: 4, revision: 3, model: "deepseek-mock-a", credentials: [{ id: primaryCredentialId, label: "Primary", enabled: true, baseUrl: secondBaseUrl, apiKey: fakeKey }],
   }, "Failed credential deletion did not restore settings after rejecting an unrecognized legacy helper.");
   assert((await readFile(rolePath, "utf8")).includes("# read-only-sentinel"), "Failed credential deletion partially removed the native role.");
   assert.equal(await readFile(configPath, "utf8"), routedConfig, "Failed credential deletion partially restored provider routing.");
   await writeFile(legacyCredentialHelper, LEGACY_NATIVE_CREDENTIAL_SOURCE, { mode: 0o600 });
   const rollbackPaths = [
     join(temp, "settings.json"), rolePath, join(temp, "native-models.json"), legacyCredentialHelper,
-    join(temp, "cleanup.mjs"), join(temp, "native-config.mjs"), join(temp, "runtime.mjs"),
+    join(temp, "cleanup.mjs"), join(temp, "native-config.mjs"), join(temp, "runtime.mjs"), join(temp, "credential-pool.mjs"),
     join(temp, "router-runtime.json"), join(temp, "router.mjs"), configPath,
   ];
   const beforeInjectedRemoval = new Map(await Promise.all(rollbackPaths.map(async (path) => [path, await readFile(path, "utf8")])));
@@ -274,6 +280,8 @@ try {
   result = (await rpc("tools/call", { name: "deepseek_credential_set", arguments: { expectedRevision: 3, baseUrl: thirdBaseUrl } })).result;
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.model, "", "Changing an active Base URL did not invalidate the previously verified model.");
+  assert.notEqual(result.structuredContent.credentials[0].id, primaryCredentialId, "Replacing an active endpoint retained the old connection identity.");
+  primaryCredentialId = result.structuredContent.credentials[0].id;
   assert.equal(result.structuredContent.nativeReady, false);
   assert.equal(await readFile(configPath, "utf8"), originalCodexConfig, "Changing Base URL did not restore the parent provider route.");
   await assertRejectsMissing(rolePath);
@@ -286,15 +294,28 @@ try {
   runtime = JSON.parse(await readFile(join(temp, "router-runtime.json"), "utf8"));
   assert.equal(runtime.deepseekBaseUrl, thirdBaseUrl, "Reinstalled native router did not use the changed Base URL.");
   assert.equal(responsesRequestPaths.at(-1), "/proxy-c/deepseek/v1/responses");
-  result = (await rpc("tools/call", { name: "deepseek_credential_delete", arguments: { expectedRevision: 5 } })).result;
+  result = (await rpc("tools/call", { name: "deepseek_credential_update", arguments: {
+    expectedRevision: 5, id: primaryCredentialId, label: "Primary", baseUrl: thirdBaseUrl, enabled: false,
+  } })).result;
+  assert.equal(result.isError, undefined, JSON.stringify(result));
+  assert.equal(result.structuredContent.nativeReady, false);
+  assert.equal(await readFile(configPath, "utf8"), originalCodexConfig, "Disabling the final enabled key did not restore the parent route.");
+  result = (await rpc("tools/call", { name: "deepseek_credential_update", arguments: {
+    expectedRevision: 6, id: primaryCredentialId, label: "Primary", baseUrl: thirdBaseUrl, enabled: true,
+  } })).result;
+  assert.equal(result.isError, undefined, JSON.stringify(result));
+  assert.equal(result.structuredContent.nativeReady, true, "Re-enabling the first key did not reinstall native routing.");
+  assert((await readFile(configPath, "utf8")).includes("DeepSeek Subagent provider definition"));
+  result = (await rpc("tools/call", { name: "deepseek_credential_delete", arguments: { expectedRevision: 7 } })).result;
   assert.equal(result.structuredContent.credentialConfigured, false);
   await assertRejectsMissing(legacyCredentialHelper);
   assert(!stdoutAll.includes(fakeKey));
   assert(modelRequests >= 2);
   assert(responsesRequests >= 2);
   const settings = JSON.parse(await readFile(join(temp, "settings.json"), "utf8"));
-  assert.equal(settings.apiKey, null);
-  assert.equal(settings.baseUrl, thirdBaseUrl, "Deleting the key should preserve the configured Base URL.");
+  assert.deepEqual(settings.credentials, []);
+  assert.equal(settings.schemaVersion, 4);
+  assert.equal(Object.hasOwn(settings, "baseUrl"), false, "Schema v4 retained a global Base URL.");
   await assertRejectsMissing(rolePath);
   await assertRejectsMissing(join(temp, "native-models.json"));
   await assertRejectsMissing(join(temp, "router-runtime.json"));
@@ -363,7 +384,7 @@ await writeFile(join(reconcileTemp, "router-runtime.json"), `${JSON.stringify({
   nodeExecutable: process.execPath,
 })}\n`);
 await writeFile(join(reconcileTemp, "router.mjs"), "// Managed by the DeepSeek Subagent Codex plugin.\n");
-const reconcileSupport = ["cleanup.mjs", "native-config.mjs", "runtime.mjs"].map((name) => join(reconcileTemp, name));
+const reconcileSupport = ["cleanup.mjs", "native-config.mjs", "runtime.mjs", "credential-pool.mjs"].map((name) => join(reconcileTemp, name));
 for (const path of reconcileSupport) await writeFile(path, "// Managed by the DeepSeek Subagent Codex plugin.\n");
 const reconcileChild = spawn(process.execPath, [join(root, "plugins/deepseek-subagent/scripts/server.mjs")], {
   cwd: root,

@@ -1568,6 +1568,7 @@ async function removeRuntimeRouterUnlocked(paths, options = {}) {
     join(dirname(paths.settingsFile), "cleanup.mjs"),
     join(dirname(paths.settingsFile), "native-config.mjs"),
     join(dirname(paths.settingsFile), "runtime.mjs"),
+    join(dirname(paths.settingsFile), "credential-pool.mjs"),
   ];
   if (!Array.isArray(cleanupSupportSnapshots) || cleanupSupportSnapshots.length > 0 &&
       (cleanupSupportSnapshots.length !== expectedCleanupSupportPaths.length || cleanupSupportSnapshots.some((snapshot, index) =>

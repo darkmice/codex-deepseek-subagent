@@ -56,6 +56,7 @@ const upstreamPort = upstream.address().port;
 try {
   await mkdir(codexHome, { recursive: true });
   await mkdir(settingsDir, { recursive: true });
+  await writeFile(join(settingsDir, "credential-pool.mjs"), await readFile(join(root, "plugins/deepseek-subagent/scripts/credential-pool.mjs"), "utf8"));
   await copyFile(codexAuthFile, join(codexHome, "auth.json"));
   if (process.platform !== "win32") await chmod(join(codexHome, "auth.json"), 0o600);
   await writeFile(paths.settingsFile, `${JSON.stringify({ schemaVersion: 2, revision: 1, model: "deepseek-flash", apiKey: "unused-live-test-key" })}\n`);

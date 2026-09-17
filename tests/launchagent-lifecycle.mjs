@@ -51,6 +51,7 @@ const runtimeLockHeld = async () => {
 try {
   await mkdir(codexHome, { recursive: true });
   await mkdir(settingsDir, { recursive: true });
+  await writeFile(join(settingsDir, "credential-pool.mjs"), await readFile(join(root, "plugins/deepseek-subagent/scripts/credential-pool.mjs"), "utf8"));
   const originalConfig = `model = "gpt-parent"
 model_provider = "custom"
 
@@ -222,7 +223,7 @@ wire_api = "responses"
   assert.equal(await runtimeRouterStatus(paths, "deepseek-flash", `http://127.0.0.1:${upstreamPort}/deepseek/v1/`), true);
   assert.equal((await fetch(`http://127.0.0.1:${reinstalledDuringCleanup.runtime.port}/${reinstalledDuringCleanup.runtime.routeToken}/healthz`)).status, 200);
 
-  const cleanupSupportPaths = ["cleanup.mjs", "native-config.mjs", "runtime.mjs"].map((name) => join(settingsDir, name));
+  const cleanupSupportPaths = ["cleanup.mjs", "native-config.mjs", "runtime.mjs", "credential-pool.mjs"].map((name) => join(settingsDir, name));
   await Promise.all(cleanupSupportPaths.map((path) => writeFile(path, "// Managed by the DeepSeek Subagent Codex plugin.\n")));
   const cleanupSupportSnapshots = await Promise.all(cleanupSupportPaths.map(async (path) => {
     const contents = await readFile(path, "utf8");
@@ -261,6 +262,7 @@ wire_api = "responses"
   }
   assert(cleaned, "Deferred LaunchAgent cleanup did not converge runtime, router, and cleanup support files.");
 
+  await writeFile(join(settingsDir, "credential-pool.mjs"), await readFile(join(root, "plugins/deepseek-subagent/scripts/credential-pool.mjs"), "utf8"));
   await installRuntimeRouter({
     paths,
     routerSourceFile: join(root, "plugins/deepseek-subagent/scripts/router.mjs"),

@@ -21,6 +21,7 @@ const originalConfig = 'model = "gpt-parent"\n\n[features.multi_agent_v2]\nenabl
 try {
   await mkdir(settingsDir, { recursive: true });
   await mkdir(codexHome, { recursive: true });
+  await writeFile(join(settingsDir, "credential-pool.mjs"), await readFile(join(root, "plugins/deepseek-subagent/scripts/credential-pool.mjs"), "utf8"));
   await writeFile(paths.settingsFile, `${JSON.stringify({ schemaVersion: 2, revision: 1, model: "deepseek-flash", apiKey: "test-key-only" })}\n`);
   await writeFile(paths.codexConfig, originalConfig);
   const routerSource = await readFile(join(root, "plugins/deepseek-subagent/scripts/router.mjs"), "utf8");
@@ -68,7 +69,7 @@ try {
   const routedConfigCreatedFromAbsent = await readFile(paths.codexConfig, "utf8");
   const runtimeBeforeFailedRemoval = await readFile(paths.runtimeFile, "utf8");
   const routerBeforeFailedRemoval = await readFile(paths.routerFile, "utf8");
-  const cleanupSupportPaths = ["cleanup.mjs", "native-config.mjs", "runtime.mjs"].map((name) => join(settingsDir, name));
+  const cleanupSupportPaths = ["cleanup.mjs", "native-config.mjs", "runtime.mjs", "credential-pool.mjs"].map((name) => join(settingsDir, name));
   await Promise.all(cleanupSupportPaths.map((path) => writeFile(path, "// Managed by the DeepSeek Subagent Codex plugin.\n")));
   const cleanupSupportSnapshots = await Promise.all(cleanupSupportPaths.map(async (path) => {
     const contents = await readFile(path, "utf8");
@@ -137,7 +138,7 @@ try {
     try { await access(changedSupport); break; } catch { await new Promise((resolveDelay) => setTimeout(resolveDelay, 5)); }
   }
   await writeFile(changedSupport, "// externally replaced during native install\n");
-  await assert.rejects(failedNativeInstall, /rollback was incomplete|could not be rolled back safely/);
+  await assert.rejects(failedNativeInstall, /rollback was incomplete|could not be rolled back safely|commit could not be verified/);
   assert.equal(await readFile(changedSupport, "utf8"), "// externally replaced during native install\n", "Install rollback overwrote a concurrent support-file replacement.");
   delete process.env.DEEPSEEK_SUBAGENT_TEST_HOLD_AFTER_SUPPORT_WRITE_MS;
   delete process.env.DEEPSEEK_SUBAGENT_TEST_FAIL_AFTER_SUPPORT_WRITE;

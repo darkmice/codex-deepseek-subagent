@@ -47,6 +47,8 @@
         padding: 13px 16px;
       }
       .row + .row { border-top: 1px solid var(--border); }
+      .row.stacked { grid-template-columns: 1fr; align-items: stretch; }
+      .row.stacked .copy span { display: block; max-width: 62ch; }
       .copy { min-width: 0; }
       .copy strong { display: block; margin-bottom: 2px; font-size: 13px; font-weight: 500; }
       .copy span, .footnote { color: var(--muted); font-size: 12px; line-height: 1.45; }
@@ -54,6 +56,7 @@
       .control { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
       .control > input, .control > select { flex: 1 1 0; width: auto; }
       .control > button { flex: 0 0 auto; }
+      .connection-form > input { flex-basis: 100%; }
 
       input, select, button { font: inherit; }
       input, select {
@@ -119,6 +122,25 @@
       .status[data-tone="error"] { color: var(--danger); }
       .status[data-tone="success"] { color: var(--success); }
       .footnote { margin: 8px 2px 0; }
+      .credential-list { display: grid; gap: 8px; width: 100%; }
+      .credential-item {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 10px 16px;
+        align-items: center;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: color-mix(in oklab, var(--text) 2%, transparent);
+      }
+      .credential-fields { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(120px, .8fr) minmax(240px, 2fr); gap: 10px; min-width: 0; }
+      .credential-field { display: grid; gap: 5px; min-width: 0; }
+      .credential-field > span { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.2; }
+      .credential-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+      .credential-actions button { min-width: 34px; padding: 0 8px; }
+      .credential-state { min-width: 72px; justify-content: center; }
+      .toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+      .toggle input { width: 16px; height: 16px; margin: 0; }
 
       @media (max-width: 640px) {
         .shell { padding: 24px 16px 32px; }
@@ -126,6 +148,9 @@
         .row { grid-template-columns: 1fr; gap: 10px; align-items: stretch; }
         .control { justify-content: stretch; }
         .control > input, .control > select { flex: 1 1 100%; }
+        .credential-item { grid-template-columns: 1fr auto; }
+        .credential-fields { grid-column: 1 / -1; grid-template-columns: 1fr; }
+        .credential-actions { grid-column: 1 / -1; justify-content: flex-end; }
       }
     </style>
   </head>
@@ -137,7 +162,7 @@
             <h1>DeepSeek Subagent</h1>
             <p class="lead" data-i18n="lead"></p>
           </div>
-          <select id="language" aria-label="Language">
+          <select id="language" data-i18n-aria-label="languageAria" aria-label="Language">
             <option value="en">English</option>
             <option value="zh">中文</option>
           </select>
@@ -147,27 +172,27 @@
           <h2 data-i18n="connection"></h2>
           <div class="card">
             <div class="row">
-              <div class="copy"><strong>API key</strong><span data-i18n="keyStorage"></span></div>
+              <div class="copy"><strong data-i18n="apiKeys"></strong><span data-i18n="keyStorage"></span></div>
               <div class="control"><span id="credentialBadge" class="badge"></span></div>
             </div>
-            <div class="row">
-              <div class="copy"><strong>Base URL</strong><span data-i18n="baseUrlHelp"></span></div>
-              <div class="control">
-                <input id="baseUrl" type="url" inputmode="url" autocomplete="url" spellcheck="false" aria-label="DeepSeek API base URL" />
-              </div>
+            <div class="row stacked">
+              <div class="copy"><strong data-i18n="credentialPool"></strong><span data-i18n="credentialPoolHelp"></span></div>
+              <div id="credentialList" class="credential-list"></div>
             </div>
             <div class="row">
-              <div class="copy"><strong data-i18n="updateKey"></strong><span data-i18n="updateKeyHelp"></span></div>
-              <div class="control">
-                <input id="apiKey" type="password" inputmode="text" autocomplete="off" spellcheck="false" aria-label="DeepSeek API key" />
-                <button id="saveKey" class="primary" type="button" data-i18n="saveConnection"></button>
+              <div class="copy"><strong data-i18n="addKey"></strong><span data-i18n="addKeyHelp"></span></div>
+              <div class="control connection-form">
+                <input id="keyLabel" type="text" autocomplete="off" spellcheck="false" data-i18n-aria-label="newKeyLabelAria" data-i18n-placeholder="labelPlaceholder" aria-label="DeepSeek connection label" placeholder="Label" />
+                <input id="newBaseUrl" type="url" inputmode="url" autocomplete="url" spellcheck="false" value="https://api.deepseek.com/v1/" data-i18n-aria-label="newBaseUrlAria" data-i18n-placeholder="baseUrlPlaceholder" aria-label="DeepSeek API base URL for this connection" placeholder="Base URL" />
+                <input id="apiKey" type="password" inputmode="text" autocomplete="off" spellcheck="false" data-i18n-aria-label="newKeyAria" data-i18n-placeholder="apiKeyPlaceholder" aria-label="DeepSeek API key" placeholder="API key" />
+                <button id="addKey" class="primary" type="button" data-i18n="add"></button>
               </div>
             </div>
             <div class="row">
               <div class="copy"><strong data-i18n="connectionTest"></strong><span data-i18n="connectionTestHelp"></span></div>
               <div class="control">
                 <button id="testConnection" type="button" data-i18n="test"></button>
-                <button id="deleteKey" class="danger" type="button" data-i18n="delete"></button>
+                <button id="deleteKeys" class="danger" type="button" data-i18n="deleteAll"></button>
               </div>
             </div>
           </div>
@@ -180,7 +205,7 @@
             <div class="row">
               <div class="copy"><strong data-i18n="defaultModel"></strong><span data-i18n="modelHelp"></span></div>
               <div class="control">
-                <select id="model" aria-label="DeepSeek model"></select>
+                <select id="model" data-i18n-aria-label="modelAria" aria-label="DeepSeek model"></select>
                 <button id="refreshModels" type="button" data-i18n="refresh"></button>
                 <button id="saveModel" class="primary" type="button" data-i18n="save"></button>
               </div>
@@ -204,24 +229,28 @@
           read: "deepseek_settings",
           save: "deepseek_settings_save",
           models: "deepseek_models_list",
-          setKey: "deepseek_credential_set",
-          deleteKey: "deepseek_credential_delete",
+          addKey: "deepseek_credential_add",
+          updateKey: "deepseek_credential_update",
+          moveKey: "deepseek_credential_move",
+          removeKey: "deepseek_credential_remove",
+          deleteKeys: "deepseek_credential_delete",
           test: "deepseek_connection_test",
         };
         const text = {
           en: {
-            lead: "Configure DeepSeek for native Codex child tasks. A local loopback router preserves the parent provider and routes requests whose model matches the selected DeepSeek model.",
-            connection: "Connection", keyStorage: "Stored in this user's platform-specific settings file.", configured: "Configured ••••••••", missing: "Not configured",
-            baseUrlHelp: "Use the official DeepSeek endpoint or a compatible Responses API proxy. HTTPS is required except for loopback testing.",
-            updateKey: "API key", updateKeyHelp: "Leave this blank to keep the saved key. The input is cleared after saving.", save: "Save", saveConnection: "Save connection",
-            connectionTest: "Connection test", connectionTestHelp: "Refreshes models and tests the selected Responses model with a tiny request.", test: "Test connection", delete: "Delete key",
-            secretNote: "The key is stored only in the private local settings file and is sent as authorization only to the configured DeepSeek API. Parent authorization is never forwarded to DeepSeek.", nativeAgent: "Native child task", defaultModel: "Default model",
-            modelHelp: "Shows DeepSeek GET /v1/models plus deepseek-flash; the selected model is verified through Responses when saved.", nativeStatus: "Native routing", nativeHelp: "Requires [features.multi_agent_v2] enabled = true in Codex config, then installs a user-scoped loopback provider router on macOS, Windows, or Linux. hide_spawn_agent_metadata = false is optional and only controls metadata visibility.", nativeReady: "Ready", nativeMissing: "Setup required", restartNote: "A delegated request may send its task message, model context, tool definitions/results, and attachments to DeepSeek. Saving or updating a model requires Save model again, then a new Codex task. Before uninstalling, delete the key here or run the independent cleanup command documented in the README. Deleting the key disables DeepSeek immediately, restores new tasks, and keeps parent pass-through alive for up to 10 minutes for already-open tasks.", refresh: "Refresh", configureFirst: "Configure an API key first", noModels: "No models returned",
-            loading: "Loading settings…", ready: "Settings ready.", savingKey: "Saving connection…", keySaved: "Connection saved and models refreshed.",
-            deleting: "Deleting API key…", deleted: "API key deleted.", refreshing: "Refreshing model list…", refreshed: "Model list refreshed.",
+            lead: "Configure DeepSeek for native Codex child tasks. A local loopback router preserves the parent provider and routes requests whose model matches the selected DeepSeek model.", languageAria: "Language", baseUrlAria: "DeepSeek API base URL", newBaseUrlAria: "API base URL for this DeepSeek connection", newKeyLabelAria: "New DeepSeek connection label", newKeyAria: "New DeepSeek API key", modelAria: "DeepSeek model", labelPlaceholder: "Label", baseUrlPlaceholder: "Base URL", apiKeyPlaceholder: "API key",
+            connection: "Connections", apiKeys: "Connection pool", baseUrl: "Base URL", keyStorage: "Up to 8 Base URL + API key pairs, stored only in this user's private platform-specific settings file.", configured: "{enabled} enabled / {total} total", missing: "Not configured",
+            credentialPool: "Failover order", credentialPoolHelp: "Each row is one Base URL + API key pair. Requests use enabled connections from top to bottom. Only 401 and 402 move to the next connection; rate limits, server errors, TLS errors, and timeouts do not.",
+            addKey: "Add connection", addKeyHelp: "Set a local label, Base URL, and API key. The secret is never shown again.", add: "Add", enabled: "Enabled", labelAria: "Connection label", connectionLabel: "Label", emptyPool: "No connections configured.", moveUp: "Move up", moveDown: "Move down", remove: "Remove", deleteAll: "Delete all connections", removeConfirm: "Remove {label}? The saved secret cannot be recovered.", deleteAllConfirm: "Delete all connections and disable native DeepSeek routing? Saved secrets cannot be recovered.", save: "Save",
+            statusReady: "Ready", statusDisabled: "Disabled", statusInvalid: "Invalid", statusExhausted: "Balance low",
+            connectionTest: "Connection test", connectionTestHelp: "Refreshes models and tests the selected Responses model with a tiny request.", test: "Test connection",
+            secretNote: "Each API key is stored with its own Base URL and is sent only to that endpoint. Parent authorization is never forwarded. Multiple connections do not increase one account's rate limit.", nativeAgent: "Native child task", defaultModel: "Default model",
+            modelHelp: "Shows the model intersection across available enabled connections, plus deepseek-flash; saving verifies the selection through Responses on every available connection.", nativeStatus: "Native routing", nativeHelp: "Requires [features.multi_agent_v2] enabled = true in Codex config, then installs a user-scoped loopback provider router on macOS, Windows, or Linux. hide_spawn_agent_metadata = false is optional and only controls metadata visibility.", nativeReady: "Ready", nativeMissing: "Setup required", restartNote: "A delegated request may send its task message, model context, tool definitions/results, and attachments to DeepSeek. Saving or updating a model requires Save model again, then a new Codex task. Before uninstalling, delete all connections here or run the independent cleanup command documented in the README. Deleting all connections disables DeepSeek immediately, restores new tasks, and keeps parent pass-through alive for up to 10 minutes for already-open tasks.", refresh: "Refresh", configureFirst: "Configure a connection first", noModels: "No models returned",
+            loading: "Loading settings…", ready: "Settings ready.", savingConnection: "Saving connection…", connectionSaved: "Connection saved.", connectionSavedRefreshFailed: "The connection was saved, but the model list could not be refreshed.", addingKey: "Adding connection…", keyAdded: "Connection added.", keyAddedRefreshFailed: "The connection was added, but the model list could not be refreshed.", updatingKey: "Updating connection…", keyUpdated: "Connection updated.", movingKey: "Updating failover order…", keyMoved: "Failover order updated.", removingKey: "Removing connection…", keyRemoved: "Connection removed.",
+            deleting: "Deleting all connections…", deleted: "All connections deleted.", refreshing: "Refreshing model list…", refreshed: "Model list refreshed.",
             testing: "Testing DeepSeek connection…", tested: "Connection succeeded.", savingModel: "Saving default model…", modelSaved: "Model saved. Start a new Codex task.",
-            invalidKey: "Enter a valid DeepSeek API key.", invalidBaseUrl: "Enter an absolute HTTPS Base URL without credentials, query, or fragment.", endpointUnsaved: "Save the connection before refreshing or testing models.", selectModel: "Select an available model.", timeout: "Settings service timed out.", failed: "Operation failed.",
-            errNotConfigured: "Save an API key and select a model first.", errModelUnavailable: "The selected model is unavailable. Refresh the model list.",
+            invalidKey: "Enter a valid DeepSeek API key.", invalidLabel: "Enter a label for this connection.", invalidBaseUrl: "Enter an absolute HTTPS Base URL without credentials, query, or fragment.", selectModel: "Select an available model.", timeout: "Settings service timed out.", failed: "Operation failed.",
+            errNotConfigured: "Save a connection and select a model first.", errModelUnavailable: "The selected model is unavailable. Refresh the model list.",
             errSettingsConflict: "Settings changed in another window. Reload and try again.", errSettingsInvalid: "The local DeepSeek settings file is damaged. Follow the README recovery steps for settings.json, then reopen Settings.", errUpstreamTimeout: "DeepSeek did not respond within 30 seconds.",
             errNetwork: "Unable to reach DeepSeek. Check the network and API endpoint.", errHttp: "DeepSeek rejected the request (HTTP {status}).",
             errInvalidResponse: "DeepSeek returned an invalid response.", errNativeNotReady: "Native routing is not ready. Save the model again, then start a new Codex task.",
@@ -231,18 +260,19 @@
             errOwnership: "A routing file, service, or process is owned by another program. The plugin left it unchanged.",
           },
           zh: {
-            lead: "为 Codex 原生子任务配置 DeepSeek。本机 loopback 路由保留父任务 provider，并把请求模型与所选 DeepSeek 模型一致的请求转发给 DeepSeek。",
-            connection: "连接", keyStorage: "保存在当前用户的平台专用设置文件中。", configured: "已配置 ••••••••", missing: "未配置",
-            baseUrlHelp: "可填写 DeepSeek 官方地址或兼容 Responses API 的代理地址；除本机回环测试外必须使用 HTTPS。",
-            updateKey: "API key", updateKeyHelp: "留空会保留已保存的 Key；保存后输入框会自动清空。", save: "保存", saveConnection: "保存连接",
-            connectionTest: "连接测试", connectionTestHelp: "刷新模型，并用极小请求测试已选 Responses 模型。", test: "测试连接", delete: "删除 Key",
-            secretNote: "Key 仅持久化在私有本机设置文件，并只作为认证发送给所配置的 DeepSeek API；父任务授权绝不会转发给 DeepSeek。", nativeAgent: "原生子任务", defaultModel: "默认模型",
-            modelHelp: "显示 DeepSeek GET /v1/models 返回的模型及 deepseek-flash；保存时会通过 Responses 验证所选模型。", nativeStatus: "原生路由", nativeHelp: "要求 Codex 配置 [features.multi_agent_v2] enabled = true，然后在 macOS、Windows 或 Linux 上安装用户级本机 provider 路由。hide_spawn_agent_metadata = false 仅控制元数据是否可见，可选。", nativeReady: "已就绪", nativeMissing: "需要设置", restartNote: "委派请求可能把任务消息、模型上下文、工具定义/结果及附件发送给 DeepSeek。安装或更新后必须再次保存模型，再新建 Codex 任务。卸载插件前必须在此删除 Key，或执行 README 中的独立清理命令。删除 Key 会立即禁用 DeepSeek、为新任务恢复 provider，并为已打开任务保留最长 10 分钟的父请求透传。", refresh: "刷新", configureFirst: "请先配置 API key", noModels: "接口未返回模型",
-            loading: "正在加载设置…", ready: "设置已就绪。", savingKey: "正在保存连接…", keySaved: "连接已保存，模型列表已刷新。",
-            deleting: "正在删除 API key…", deleted: "API key 已删除。", refreshing: "正在刷新模型列表…", refreshed: "模型列表已刷新。",
+            lead: "为 Codex 原生子任务配置 DeepSeek。本机 loopback 路由保留父任务 provider，并把请求模型与所选 DeepSeek 模型一致的请求转发给 DeepSeek。", languageAria: "语言", baseUrlAria: "DeepSeek API 地址", newBaseUrlAria: "此 DeepSeek 连接的 API 地址", newKeyLabelAria: "新 DeepSeek 连接标签", newKeyAria: "新 DeepSeek API Key", modelAria: "DeepSeek 模型", labelPlaceholder: "连接标签", baseUrlPlaceholder: "Base URL", apiKeyPlaceholder: "API Key",
+            connection: "连接", apiKeys: "连接池", baseUrl: "Base URL", keyStorage: "最多 8 组 Base URL + API Key，仅保存在当前用户的私有平台设置文件中。", configured: "已启用 {enabled} / 共 {total}", missing: "未配置",
+            credentialPool: "故障转移顺序", credentialPoolHelp: "每一项都是一组 Base URL + API Key。请求按从上到下的顺序使用已启用连接；只有 401 和 402 会切换下一组，限流、服务端错误、TLS 错误和超时都不会切换。",
+            addKey: "添加连接", addKeyHelp: "填写本机标签、Base URL 和 API Key；密钥保存后不会再次显示。", add: "添加", enabled: "启用", labelAria: "连接标签", connectionLabel: "连接标签", emptyPool: "尚未配置连接。", moveUp: "上移", moveDown: "下移", remove: "删除", deleteAll: "删除全部连接", removeConfirm: "确定删除 {label}？已保存的密钥无法恢复。", deleteAllConfirm: "确定删除全部连接并停用 DeepSeek 原生路由？已保存的密钥无法恢复。", save: "保存",
+            statusReady: "可用", statusDisabled: "已停用", statusInvalid: "无效", statusExhausted: "余额不足",
+            connectionTest: "连接测试", connectionTestHelp: "刷新模型，并用极小请求测试已选 Responses 模型。", test: "测试连接",
+            secretNote: "每个 API Key 都与自己的 Base URL 成组保存，并且只会发送到该地址；父任务授权绝不会转发。多组连接不会提高同一账户的限流额度。", nativeAgent: "原生子任务", defaultModel: "默认模型",
+            modelHelp: "显示当前可用且已启用连接的模型交集及 deepseek-flash；保存时会在每个可用连接上通过 Responses 验证所选模型。", nativeStatus: "原生路由", nativeHelp: "要求 Codex 配置 [features.multi_agent_v2] enabled = true，然后在 macOS、Windows 或 Linux 上安装用户级本机 provider 路由。hide_spawn_agent_metadata = false 仅控制元数据是否可见，可选。", nativeReady: "已就绪", nativeMissing: "需要设置", restartNote: "委派请求可能把任务消息、模型上下文、工具定义/结果及附件发送给 DeepSeek。安装或更新后必须再次保存模型，再新建 Codex 任务。卸载插件前必须在此删除全部连接，或执行 README 中的独立清理命令。删除全部连接会立即禁用 DeepSeek、为新任务恢复 provider，并为已打开任务保留最长 10 分钟的父请求透传。", refresh: "刷新", configureFirst: "请先配置连接", noModels: "接口未返回模型",
+            loading: "正在加载设置…", ready: "设置已就绪。", savingConnection: "正在保存连接…", connectionSaved: "连接已保存。", connectionSavedRefreshFailed: "连接已保存，但模型列表刷新失败。", addingKey: "正在添加连接…", keyAdded: "连接已添加。", keyAddedRefreshFailed: "连接已添加，但模型列表刷新失败。", updatingKey: "正在更新连接…", keyUpdated: "连接已更新。", movingKey: "正在更新故障转移顺序…", keyMoved: "故障转移顺序已更新。", removingKey: "正在删除连接…", keyRemoved: "连接已删除。",
+            deleting: "正在删除全部连接…", deleted: "全部连接已删除。", refreshing: "正在刷新模型列表…", refreshed: "模型列表已刷新。",
             testing: "正在测试 DeepSeek 连接…", tested: "连接成功。", savingModel: "正在保存默认模型…", modelSaved: "模型已保存，请新建 Codex 任务。",
-            invalidKey: "请输入有效的 DeepSeek API key。", invalidBaseUrl: "请输入不含凭据、查询参数或片段的绝对 HTTPS Base URL。", endpointUnsaved: "请先保存连接，再刷新或测试模型。", selectModel: "请选择可用模型。", timeout: "设置服务响应超时。", failed: "操作失败。",
-            errNotConfigured: "请先保存 API key 并选择模型。", errModelUnavailable: "所选模型不可用，请刷新模型列表。",
+            invalidKey: "请输入有效的 DeepSeek API key。", invalidLabel: "请填写连接标签。", invalidBaseUrl: "请输入不含凭据、查询参数或片段的绝对 HTTPS Base URL。", selectModel: "请选择可用模型。", timeout: "设置服务响应超时。", failed: "操作失败。",
+            errNotConfigured: "请先保存连接并选择模型。", errModelUnavailable: "所选模型不可用，请刷新模型列表。",
             errSettingsConflict: "设置已被其他窗口修改，请重新加载后再试。", errSettingsInvalid: "本机 DeepSeek 设置文件已损坏，请按 README 的 settings.json 恢复步骤处理后重新打开设置页。", errUpstreamTimeout: "DeepSeek 在 30 秒内没有响应。",
             errNetwork: "无法连接 DeepSeek，请检查网络和 API 地址。", errHttp: "DeepSeek 拒绝了请求（HTTP {status}）。",
             errInvalidResponse: "DeepSeek 返回了无效响应。", errNativeNotReady: "原生路由尚未就绪，请重新保存模型并新建 Codex 任务。",
@@ -258,19 +288,19 @@
         let snapshot = null;
         let modelList = [];
         let busy = false;
-        let endpointDirty = false;
         let manualLanguage = false;
         let currentStatusKey = "";
         const LONG_TOOL_TIMEOUT_MS = 115000;
         const main = document.querySelector("main");
         const languageInput = document.getElementById("language");
         const keyInput = document.getElementById("apiKey");
-        const baseUrlInput = document.getElementById("baseUrl");
+        const keyLabelInput = document.getElementById("keyLabel");
+        const newBaseUrlInput = document.getElementById("newBaseUrl");
         const modelInput = document.getElementById("model");
+        const credentialList = document.getElementById("credentialList");
         const badge = document.getElementById("credentialBadge");
         const nativeBadge = document.getElementById("nativeBadge");
         const status = document.getElementById("status");
-        const buttons = [...document.querySelectorAll("button")];
 
         function normalizedLanguage(value) { return String(value || "").toLowerCase().startsWith("zh") ? "zh" : "en"; }
         let language = normalizedLanguage(navigator.language);
@@ -281,6 +311,8 @@
           document.documentElement.lang = language === "zh" ? "zh-CN" : "en";
           languageInput.value = language;
           document.querySelectorAll("[data-i18n]").forEach((element) => { element.textContent = t(element.dataset.i18n); });
+          document.querySelectorAll("[data-i18n-aria-label]").forEach((element) => { element.setAttribute("aria-label", t(element.dataset.i18nAriaLabel)); });
+          document.querySelectorAll("[data-i18n-placeholder]").forEach((element) => { element.setAttribute("placeholder", t(element.dataset.i18nPlaceholder)); });
           render(snapshot);
           renderModels(modelList, modelInput.value || snapshot?.model || "");
           if (currentStatusKey) status.textContent = t(currentStatusKey);
@@ -289,9 +321,7 @@
         function setBusy(next) {
           busy = next;
           main.setAttribute("aria-busy", String(next));
-          buttons.forEach((button) => { button.disabled = next; });
-          keyInput.disabled = next;
-          baseUrlInput.disabled = next;
+          document.querySelectorAll("button, input").forEach((control) => { control.disabled = next; });
           modelInput.disabled = next || modelList.length === 0;
           languageInput.disabled = false;
           if (!next && snapshot) render(snapshot);
@@ -319,7 +349,7 @@
         async function initializeBridge() {
           if (!bridgeReady) bridgeReady = (async () => {
             const result = await rpcRequest("ui/initialize", {
-              appInfo: { name: "DeepSeek Subagent", version: "0.6.0+codex.20260916122412" },
+              appInfo: { name: "DeepSeek Subagent", version: "0.7.0+codex.20260917054058" },
               appCapabilities: {},
               protocolVersion: PROTOCOL_VERSION,
             }, 8000);
@@ -358,19 +388,108 @@
           const template = t(keys[error?.code] || "failed");
           return template.replace("{status}", String(error?.params?.status || "?"));
         }
+        function renderCredentials(credentials) {
+          credentialList.replaceChildren();
+          if (!Array.isArray(credentials) || credentials.length === 0) {
+            const empty = document.createElement("span");
+            empty.className = "footnote";
+            empty.textContent = t("emptyPool");
+            credentialList.appendChild(empty);
+            return;
+          }
+          credentials.forEach((credential, index) => {
+            const item = document.createElement("div");
+            item.className = "credential-item";
+            const fields = document.createElement("div");
+            fields.className = "credential-fields";
+            const label = document.createElement("input");
+            label.type = "text";
+            label.value = credential.label;
+            label.maxLength = 128;
+            label.disabled = busy;
+            label.setAttribute("aria-label", `${credential.label}: ${t("labelAria")}`);
+            label.addEventListener("change", () => {
+              const value = label.value.trim();
+              if (!value || value === credential.label) { label.value = credential.label; return; }
+              void updateCredential(credential.id, value, credential.baseUrl, credential.enabled, false);
+            });
+            const labelField = document.createElement("label");
+            labelField.className = "credential-field";
+            const labelCaption = document.createElement("span");
+            labelCaption.textContent = t("connectionLabel");
+            labelField.append(labelCaption, label);
+            const baseUrl = document.createElement("input");
+            baseUrl.type = "url";
+            baseUrl.inputMode = "url";
+            baseUrl.autocomplete = "url";
+            baseUrl.spellcheck = false;
+            baseUrl.value = credential.baseUrl;
+            baseUrl.disabled = busy;
+            baseUrl.setAttribute("aria-label", `${credential.label}: ${t("baseUrlAria")}`);
+            baseUrl.addEventListener("change", () => {
+              const value = baseUrl.value.trim();
+              if (!validBaseUrl(value)) { baseUrl.value = credential.baseUrl; setStatus(t("invalidBaseUrl"), "error", "invalidBaseUrl"); return; }
+              if (value === credential.baseUrl) return;
+              void updateCredential(credential.id, credential.label, value, credential.enabled, credential.enabled);
+            });
+            const baseUrlField = document.createElement("label");
+            baseUrlField.className = "credential-field";
+            const baseUrlCaption = document.createElement("span");
+            baseUrlCaption.textContent = t("baseUrl");
+            baseUrlField.append(baseUrlCaption, baseUrl);
+            fields.append(labelField, baseUrlField);
+            const enabled = document.createElement("label");
+            enabled.className = "toggle";
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.checked = credential.enabled;
+            checkbox.disabled = busy;
+            checkbox.setAttribute("aria-label", `${credential.label}: ${t("enabled")}`);
+            checkbox.addEventListener("change", () => void updateCredential(
+              credential.id, credential.label, credential.baseUrl, checkbox.checked, !credential.enabled && checkbox.checked,
+            ));
+            const enabledText = document.createElement("span");
+            enabledText.textContent = t("enabled");
+            enabled.append(checkbox, enabledText);
+            const actions = document.createElement("div");
+            actions.className = "credential-actions";
+            const state = document.createElement("span");
+            state.className = "badge credential-state";
+            state.dataset.state = credential.status === "ready" ? "configured" : credential.status === "disabled" ? "" : "missing";
+            state.textContent = t({ ready: "statusReady", disabled: "statusDisabled", invalid: "statusInvalid", exhausted: "statusExhausted" }[credential.status] || "statusReady");
+            const up = document.createElement("button");
+            up.type = "button"; up.textContent = "↑"; up.title = t("moveUp"); up.disabled = busy || index === 0;
+            up.setAttribute("aria-label", `${credential.label}: ${t("moveUp")}`);
+            up.addEventListener("click", () => void moveCredential(credential.id, "up"));
+            const down = document.createElement("button");
+            down.type = "button"; down.textContent = "↓"; down.title = t("moveDown"); down.disabled = busy || index === credentials.length - 1;
+            down.setAttribute("aria-label", `${credential.label}: ${t("moveDown")}`);
+            down.addEventListener("click", () => void moveCredential(credential.id, "down"));
+            const remove = document.createElement("button");
+            remove.type = "button"; remove.className = "danger"; remove.textContent = t("remove"); remove.disabled = busy;
+            remove.setAttribute("aria-label", `${credential.label}: ${t("remove")}`);
+            remove.addEventListener("click", () => void removeCredential(credential.id));
+            actions.append(state, up, down, remove);
+            item.append(fields, enabled, actions);
+            credentialList.appendChild(item);
+          });
+        }
         function render(next) {
           if (!next) return;
           snapshot = next;
-          if (!endpointDirty && typeof next.baseUrl === "string") baseUrlInput.value = next.baseUrl;
           badge.dataset.state = next.credentialConfigured ? "configured" : "missing";
-          badge.textContent = next.credentialConfigured ? t("configured") : t("missing");
+          badge.textContent = next.credentialConfigured
+            ? t("configured").replace("{enabled}", String(next.enabledCredentialCount || 0)).replace("{total}", String(next.credentials?.length || 0))
+            : t("missing");
+          renderCredentials(next.credentials);
           nativeBadge.dataset.state = next.nativeReady ? "configured" : "missing";
           nativeBadge.textContent = next.nativeReady ? t("nativeReady") : t("nativeMissing");
           if (!busy) {
-            document.getElementById("deleteKey").disabled = !next.credentialConfigured;
-            document.getElementById("testConnection").disabled = !next.credentialConfigured || endpointDirty;
-            document.getElementById("refreshModels").disabled = !next.credentialConfigured || endpointDirty;
-            document.getElementById("saveModel").disabled = !next.credentialConfigured || endpointDirty || modelList.length === 0;
+            document.getElementById("deleteKeys").disabled = !next.credentialConfigured;
+            document.getElementById("testConnection").disabled = next.enabledCredentialCount < 1;
+            document.getElementById("refreshModels").disabled = next.enabledCredentialCount < 1;
+            document.getElementById("saveModel").disabled = next.enabledCredentialCount < 1 || modelList.length === 0;
+            document.getElementById("addKey").disabled = next.credentials?.length >= 8;
           }
         }
         function renderModels(models, selected) {
@@ -379,7 +498,7 @@
           if (!modelList.length) {
             const option = document.createElement("option");
             option.value = "";
-            option.textContent = snapshot?.credentialConfigured ? t("noModels") : t("configureFirst");
+            option.textContent = snapshot?.enabledCredentialCount > 0 ? t("noModels") : t("configureFirst");
             modelInput.appendChild(option);
           } else {
             for (const model of modelList) {
@@ -412,6 +531,7 @@
             const next = structured(result);
             if (next && typeof next.credentialConfigured === "boolean") render(next);
             setStatus(t(successKey), "success", successKey);
+            return result;
           } catch (error) {
             if (error?.code === "BRIDGE_TIMEOUT") {
               try {
@@ -421,8 +541,54 @@
               } catch {}
             }
             setStatus(localizedError(error), "error");
+            return null;
           }
           finally { setBusy(false); }
+        }
+        async function refreshAfterPersisted(partialFailureKey) {
+          setBusy(true);
+          setStatus(t("refreshing"), "", "refreshing");
+          try {
+            await refreshModels(true);
+            setStatus(t("refreshed"), "success", "refreshed");
+          } catch {
+            setStatus(t(partialFailureKey), "error", partialFailureKey);
+          } finally { setBusy(false); }
+        }
+        function validBaseUrl(value) {
+          try {
+            const parsed = new URL(value);
+            const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+            return ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password && !parsed.search && !parsed.hash &&
+              (parsed.protocol !== "http:" || ["127.0.0.1", "localhost", "::1"].includes(hostname));
+          } catch { return false; }
+        }
+        async function updateCredential(id, label, baseUrl, enabled, refreshAfterUpdate) {
+          const persisted = await action("updatingKey", "keyUpdated", () => callTool(TOOL.updateKey, {
+            expectedRevision: snapshot?.revision || 0, id, label, baseUrl, enabled,
+          }, 30000));
+          const next = structured(persisted);
+          if (next && !next.model) renderModels([], "");
+          if (persisted && refreshAfterUpdate && next?.enabledCredentialCount > 0) {
+            await refreshAfterPersisted("connectionSavedRefreshFailed");
+          }
+          return persisted;
+        }
+        function moveCredential(id, direction) {
+          return action("movingKey", "keyMoved", () => callTool(TOOL.moveKey, {
+            expectedRevision: snapshot?.revision || 0, id, direction,
+          }, 30000));
+        }
+        function removeCredential(id) {
+          const credential = snapshot?.credentials?.find((candidate) => candidate.id === id);
+          if (!credential || !window.confirm(t("removeConfirm").replace("{label}", credential.label))) return;
+          return action("removingKey", "keyRemoved", async () => {
+            const result = await callTool(TOOL.removeKey, { expectedRevision: snapshot?.revision || 0, id }, 30000);
+            const failed = failure(result); if (failed) throw failed;
+            const next = structured(result);
+            if (next?.enabledCredentialCount < 1) renderModels([], "");
+            return result;
+          });
         }
         async function load() {
           setBusy(true);
@@ -432,9 +598,10 @@
             const toolFailure = failure(result);
             if (toolFailure) throw toolFailure;
             const next = structured(result);
-            if (!next || typeof next.credentialConfigured !== "boolean" || typeof next.model !== "string" || typeof next.baseUrl !== "string") throw new Error(t("failed"));
+            if (!next || typeof next.credentialConfigured !== "boolean" || !Array.isArray(next.credentials) || typeof next.model !== "string" ||
+                next.credentials.some((credential) => typeof credential?.baseUrl !== "string")) throw new Error(t("failed"));
             render(next);
-            if (next.credentialConfigured) await refreshModels(false);
+            if (next.enabledCredentialCount > 0) await refreshModels(false);
             else renderModels([], "");
             setStatus(t("ready"), "success", "ready");
           } catch (error) { setStatus(localizedError(error), "error"); }
@@ -442,46 +609,33 @@
         }
 
         languageInput.addEventListener("change", () => applyLanguage(languageInput.value, true));
-        baseUrlInput.addEventListener("input", () => {
-          endpointDirty = baseUrlInput.value.trim() !== (snapshot?.baseUrl || "");
-          if (endpointDirty) renderModels([], "");
-          else if (snapshot?.credentialConfigured) void action("refreshing", "refreshed", () => refreshModels(false));
-          if (snapshot) render(snapshot);
-        });
-        document.getElementById("saveKey").addEventListener("click", () => {
+        document.getElementById("addKey").addEventListener("click", () => {
+          const label = keyLabelInput.value.trim();
+          const baseUrl = newBaseUrlInput.value.trim();
           const apiKey = keyInput.value.trim();
-          const baseUrl = baseUrlInput.value.trim();
-          let parsedBaseUrl;
-          try { parsedBaseUrl = new URL(baseUrl); }
-          catch { setStatus(t("invalidBaseUrl"), "error", "invalidBaseUrl"); return; }
-          const hostname = parsedBaseUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-          if (!["http:", "https:"].includes(parsedBaseUrl.protocol) || parsedBaseUrl.username || parsedBaseUrl.password || parsedBaseUrl.search || parsedBaseUrl.hash ||
-              (parsedBaseUrl.protocol === "http:" && !["127.0.0.1", "localhost", "::1"].includes(hostname))) {
-            setStatus(t("invalidBaseUrl"), "error", "invalidBaseUrl"); return;
-          }
-          if (!snapshot?.credentialConfigured && apiKey.length < 8) { setStatus(t("invalidKey"), "error", "invalidKey"); return; }
-          if (apiKey && apiKey.length < 8) { setStatus(t("invalidKey"), "error", "invalidKey"); return; }
-          void action("savingKey", "keySaved", async () => {
-            const saved = await callTool(TOOL.setKey, {
-              expectedRevision: snapshot?.revision || 0,
-              baseUrl,
-              ...(apiKey ? { apiKey } : {}),
-            }, 30000);
-            const toolFailure = failure(saved);
-            if (toolFailure) throw toolFailure;
-            endpointDirty = false;
-            render(structured(saved));
-            keyInput.value = "";
-            await refreshModels(true);
-            return saved;
+          if (!label) { setStatus(t("invalidLabel"), "error", "invalidLabel"); return; }
+          if (!validBaseUrl(baseUrl)) { setStatus(t("invalidBaseUrl"), "error", "invalidBaseUrl"); return; }
+          if (apiKey.length < 8) { setStatus(t("invalidKey"), "error", "invalidKey"); return; }
+          void (async () => {
+            const persisted = await action("addingKey", "keyAdded", async () => {
+              const result = await callTool(TOOL.addKey, { expectedRevision: snapshot?.revision || 0, label, baseUrl, apiKey }, 30000);
+              const failed = failure(result); if (failed) throw failed;
+              keyLabelInput.value = "";
+              keyInput.value = "";
+              return result;
+            });
+            if (persisted && structured(persisted)?.enabledCredentialCount > 0) await refreshAfterPersisted("keyAddedRefreshFailed");
+          })();
+        });
+        document.getElementById("deleteKeys").addEventListener("click", () => {
+          if (!window.confirm(t("deleteAllConfirm"))) return;
+          void action("deleting", "deleted", async () => {
+            const result = await callTool(TOOL.deleteKeys, { expectedRevision: snapshot?.revision || 0 });
+            const failed = failure(result); if (failed) throw failed;
+            renderModels([], "");
+            return result;
           });
         });
-        document.getElementById("deleteKey").addEventListener("click", () => void action("deleting", "deleted", async () => {
-          const result = await callTool(TOOL.deleteKey, { expectedRevision: snapshot?.revision || 0 });
-          const failed = failure(result); if (failed) throw failed;
-          renderModels([], "");
-          return result;
-        }));
         document.getElementById("refreshModels").addEventListener("click", () => void action("refreshing", "refreshed", () => refreshModels(true)));
         document.getElementById("testConnection").addEventListener("click", () => {
           if (!modelInput.value) { setStatus(t("selectModel"), "error", "selectModel"); return; }

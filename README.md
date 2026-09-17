@@ -21,7 +21,8 @@ a shell command. / 将下面这段话直接发给 Codex。Codex 应保留已有�
 4. 检查 Codex 配置（默认是用户目录下的 `.codex/config.toml`），仅在缺失时加入
    `[features.multi_agent_v2]` 和 `enabled = true`，保留其他现有配置。
 5. 不要向我索取或代填 DeepSeek API Key。安装完成后，让我亲自在
-   Settings → Integrations → DeepSeek Subagent 中填写 Key、刷新模型并保存模型。
+   Settings → Integrations → DeepSeek Subagent 中填写一组或多组独立的
+   Base URL + API Key 连接、刷新模型并保存模型。
 6. 提醒我保存模型后新建一个 Codex 任务，再用原生 DeepSeek 子智能体做一次测试；
    正常委派不应打开 Settings 页面。
 7. 确认原生路由状态为“已就绪”。macOS 使用用户级 LaunchAgent；Windows 和
@@ -89,14 +90,16 @@ DeepSeek；GPT 在报告完成前必须检查真实产物并重新验证。
    root-level `multi_agent_v2.hide_spawn_agent_metadata` setting if present;
    current Codex releases reject it in strict config mode.
 5. Start a Codex task, open **Settings → Integrations → DeepSeek Subagent**,
-   save the Base URL, key, and model, then start one new task. The Base URL
-   defaults to DeepSeek's official `/v1/` endpoint and also accepts compatible
-   HTTPS Responses API proxies. Saving the model installs a
+   add one or more Base URL + API key connections, refresh and save the model,
+   then start one new task. Each connection has its own Base URL; new connections
+   default to DeepSeek's official `/v1/` endpoint and may instead use a compatible
+   HTTPS Responses API proxy. Saving the model installs a
    user-scoped router and a marked, reversible loopback provider route. macOS
    uses LaunchAgent; Windows and Linux use an authenticated detached process
    that requires no administrator privileges. / 先按第 4 步启用 Multi-Agent v2；
-   再打开设置页保存 Base URL、key 和模型。Base URL 默认使用 DeepSeek 官方 `/v1/`
-   地址，也支持兼容 Responses API 的 HTTPS 代理。保存模型会安装用户级 router 与带标记、可恢复的
+   再打开设置页添加一组或多组 Base URL + API Key 连接，刷新并保存模型。每组连接
+   都有自己的 Base URL；新连接默认使用 DeepSeek 官方 `/v1/` 地址，也可改为兼容
+   Responses API 的 HTTPS 代理。保存模型会安装用户级 router 与带标记、可恢复的
    本机 provider 路由；macOS 使用 LaunchAgent，Windows/Linux 使用无需管理员权限的
    受认证后台进程。随后新建一个任务。
 
@@ -133,6 +136,19 @@ catalog while `deepseek-flash` is registered as text-and-image capable.
 Custom providers with unsupported routing or header fields are rejected rather
 than silently changing their data path.
 
+The settings page supports an ordered pool of up to eight independently enabled
+connections. Each item is one inseparable Base URL + API key pair. Model discovery
+uses the intersection reported by the currently available enabled connections.
+Before any response bytes are forwarded, HTTP `401` isolates an invalid connection
+and HTTP `402` temporarily skips a connection with insufficient balance, then the
+router switches both endpoint and key to the next enabled item. It deliberately does not switch on `429`,
+`5xx`, TLS/network errors, or timeouts: DeepSeek rate limits are account-scoped,
+and replaying ambiguous failures can duplicate work. Once a task succeeds on a
+connection, all of its tool continuations stay pinned to that same connection;
+streaming output is never replayed after it starts. Existing schema v1/v2 single-key
+settings and schema v3 shared-Base-URL pools migrate locally to schema v4 on the
+next settings write without exposing the secret.
+
 原生路由支持 macOS、Windows 与 Linux，并依赖支持 custom agents 与原生 subagent
 workflow 的新版 Codex。生效后的 provider 是本机 loopback router：父任务转发至当前 provider
 解析出的原上游；请求模型与所选 DeepSeek 模型一致时才会发往 DeepSeek。若自定义
@@ -155,10 +171,22 @@ router 返回随机唯一任务名，skill 随即把同一任务名与正文交�
 路由还会把插件生成的 DeepSeek metadata 合并到父 provider 的 `/models` 响应中，父任务
 保留官方模型目录，同时将 `deepseek-flash` 注册为 text+image 模型。
 
+设置页支持最多 8 个可独立启停、可排序的连接；每一项都是不可拆分的一组
+Base URL + API Key。模型发现取当前可用且已启用连接的模型交集。仅在尚未向 Codex
+输出任何响应字节时，`401` 会隔离无效连接，`402` 会暂时跳过余额不足的连接，并将
+地址和 Key 一起切换到下一个已启用连接；
+`429`、`5xx`、TLS/网络错误和超时不会切换，因为 DeepSeek 限流按账户计算，重放不确定
+失败还可能重复执行。任务一旦用某组连接成功，其工具续轮就固定使用同一组 Base URL
+和 Key；流式输出开始后绝不重放。旧 schema v1/v2 单 Key 配置与 schema v3 共享地址
+连接池会在下一次设置写入时迁移为 schema v4，不暴露密钥。
+
 The loopback router binds only to `127.0.0.1`, never logs request bodies or
 authorization headers, and replaces the parent authorization before a request
-is sent to DeepSeek. A delegated provider payload may include the task message,
-model context, tool definitions/results, and attachments. Deleting the key
+is sent to DeepSeek. DeepSeek response headers are normalized, error bodies are
+replaced, and successful response streams are checked for the active Key before
+returning to Codex, so a compatible proxy cannot reflect it into task output or
+logs. A delegated provider payload may include the task message,
+model context, tool definitions/results, and attachments. Deleting all keys
 immediately disables DeepSeek and restores the previous provider for new tasks;
 parent pass-through remains available for already-open tasks for up to ten
 minutes. On macOS, a conflicting LaunchAgent path or registered label is left
@@ -228,7 +256,7 @@ README. Reopen Settings to recreate it. If uninstalling, run cleanup again
 after removing the damaged file. Never share the backup because it may contain
 the API key.
 
-卸载插件前，请先在设置页点击**删除 Key**，或执行上面的独立清理命令。保存模型时会把
+卸载插件前，请先在设置页点击**删除全部 Key**，或执行上面的独立清理命令。保存模型时会把
 该命令安装到用户设置目录，所以即使插件源码已经删除，它仍可执行。请按当前系统使用
 上方对应命令。独立清理会立即停止插件所有的 router 服务或进程、恢复原 Codex provider，
 并删除凭据、原生 role、router 状态和清理支持文件；随后新建 Codex 任务，再卸载插件。

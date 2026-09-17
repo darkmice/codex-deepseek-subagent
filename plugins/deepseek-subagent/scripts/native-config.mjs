@@ -7,17 +7,35 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { installRuntimeRouter, removeRuntimeRouter, runtimeCleanupStatus, runtimePaths, runtimeRouterStatus, tomlBooleanSetting } from "./runtime.mjs";
+import { credentialsFromSettingsDocument, DEFAULT_DEEPSEEK_BASE_URL } from "./credential-pool.mjs";
 
 export const NATIVE_ROLE_NAME = "deepseek";
 const MANAGED_MARKER = "# Managed by the DeepSeek Subagent Codex plugin.\n";
 const MANAGED_SCRIPT_MARKER = /^\/\/ Managed by the DeepSeek Subagent Codex plugin\.\r?\n/;
 const ROUTER_SOURCE = fileURLToPath(new URL("./router.mjs", import.meta.url));
+const CREDENTIAL_POOL_SOURCE = fileURLToPath(new URL("./credential-pool.mjs", import.meta.url));
 const NATIVE_CONFIG_SOURCE = fileURLToPath(new URL("./native-config.mjs", import.meta.url));
 const RUNTIME_SOURCE = fileURLToPath(new URL("./runtime.mjs", import.meta.url));
 const CLEANUP_SOURCE = fileURLToPath(new URL("./cleanup.mjs", import.meta.url));
 const DEEPSEEK_MODEL_PATTERN = /^deepseek-[A-Za-z0-9][A-Za-z0-9._:/-]{0,118}$/;
 const mutationLockContext = new AsyncLocalStorage();
 export const LEGACY_NATIVE_CREDENTIAL_SOURCE = `import { readFile } from "node:fs/promises";
+
+const settingsPath = process.argv[2];
+if (!settingsPath) process.exit(2);
+try {
+  const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+  const apiKey = Array.isArray(settings?.credentials)
+    ? settings.credentials.find((credential) => credential?.enabled === true)?.apiKey
+    : settings?.apiKey;
+  const length = typeof apiKey === "string" ? Buffer.byteLength(apiKey, "utf8") : 0;
+  if (length < 8 || length > 4096 || /[\\r\\n]/.test(apiKey)) process.exit(1);
+  process.stdout.write(apiKey);
+} catch {
+  process.exit(1);
+}
+`;
+export const LEGACY_NATIVE_CREDENTIAL_SOURCE_V1 = `import { readFile } from "node:fs/promises";
 
 const settingsPath = process.argv[2];
 if (!settingsPath) process.exit(2);
@@ -43,6 +61,7 @@ export function nativePaths(settingsDir) {
     cleanupFile: join(settingsDir, "cleanup.mjs"),
     cleanupNativeConfigFile: join(settingsDir, "native-config.mjs"),
     cleanupRuntimeFile: join(settingsDir, "runtime.mjs"),
+    cleanupCredentialPoolFile: join(settingsDir, "credential-pool.mjs"),
     ...runtimePaths(settingsDir, activeCodexHome),
   };
 }
@@ -413,7 +432,7 @@ export async function withNativeMutationLock(settingsDir, operation) {
 
 async function legacyCredentialSnapshot(settingsDir) {
   const snapshot = await fileSnapshot(join(settingsDir, "native-credential.mjs"));
-  if (snapshot.exists && snapshot.contents !== LEGACY_NATIVE_CREDENTIAL_SOURCE) {
+  if (snapshot.exists && ![LEGACY_NATIVE_CREDENTIAL_SOURCE, LEGACY_NATIVE_CREDENTIAL_SOURCE_V1].includes(snapshot.contents)) {
     throw new Error(`Refusing to remove an unrecognized legacy DeepSeek credential helper: ${snapshot.path}`);
   }
   return snapshot;
@@ -494,7 +513,7 @@ async function installNativeIntegrationUnlocked({
   const template = JSON.parse(await readFile(modelTemplateFile, "utf8"));
   const catalog = buildCatalog(models, model, template);
   const [snapshots, legacyCredential] = await Promise.all([
-    Promise.all([paths.roleFile, paths.catalogFile, paths.cleanupFile, paths.cleanupNativeConfigFile, paths.cleanupRuntimeFile].map(fileSnapshot)),
+    Promise.all([paths.roleFile, paths.catalogFile, paths.cleanupFile, paths.cleanupNativeConfigFile, paths.cleanupRuntimeFile, paths.cleanupCredentialPoolFile].map(fileSnapshot)),
     legacyCredentialSnapshot(settingsDir),
   ]);
   if (snapshots[0].exists && !snapshots[0].contents.startsWith(MANAGED_MARKER)) {
@@ -509,6 +528,7 @@ async function installNativeIntegrationUnlocked({
     committed[2] = await atomicWrite(paths.cleanupFile, await readFile(CLEANUP_SOURCE, "utf8"), 0o600, snapshots[2]);
     committed[3] = await atomicWrite(paths.cleanupNativeConfigFile, await readFile(NATIVE_CONFIG_SOURCE, "utf8"), 0o600, snapshots[3]);
     committed[4] = await atomicWrite(paths.cleanupRuntimeFile, await readFile(RUNTIME_SOURCE, "utf8"), 0o600, snapshots[4]);
+    committed[5] = await atomicWrite(paths.cleanupCredentialPoolFile, await readFile(CREDENTIAL_POOL_SOURCE, "utf8"), 0o600, snapshots[5]);
     if (process.env.NODE_ENV === "test" && process.env.DEEPSEEK_SUBAGENT_TEST_SETTINGS_FILE === settingsFile) {
       const holdMs = Number.parseInt(process.env.DEEPSEEK_SUBAGENT_TEST_HOLD_AFTER_SUPPORT_WRITE_MS || "0", 10);
       if (Number.isFinite(holdMs) && holdMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.min(holdMs, 5_000)));
@@ -540,7 +560,7 @@ export async function installNativeIntegration(options) {
 
 async function removeNativeIntegrationUnlocked(settingsDir, options = {}) {
   const paths = nativePaths(settingsDir);
-  const managedScripts = [paths.cleanupFile, paths.cleanupNativeConfigFile, paths.cleanupRuntimeFile];
+  const managedScripts = [paths.cleanupFile, paths.cleanupNativeConfigFile, paths.cleanupRuntimeFile, paths.cleanupCredentialPoolFile];
   const [snapshots, legacyCredential] = await Promise.all([
     Promise.all([paths.roleFile, paths.catalogFile, ...managedScripts].map(fileSnapshot)),
     legacyCredentialSnapshot(settingsDir),
@@ -556,7 +576,7 @@ async function removeNativeIntegrationUnlocked(settingsDir, options = {}) {
     quarantined.push(await quarantineSnapshot(legacyCredential, "remove"));
     await removeRuntimeRouter(paths, {
       ...options,
-      cleanupSupportSnapshots: options.keepCleanupSupport === true ? [] : snapshots.slice(2, 5),
+      cleanupSupportSnapshots: options.keepCleanupSupport === true ? [] : snapshots.slice(2, 6),
     });
     for (const entry of quarantined) if (entry) await rm(entry.quarantine);
   } catch (error) {
@@ -573,7 +593,7 @@ export async function removeNativeIntegration(settingsDir, options = {}) {
 
 async function removeNativeCleanupSupportUnlocked(settingsDir) {
   const paths = nativePaths(settingsDir);
-  const snapshots = await Promise.all([paths.cleanupFile, paths.cleanupNativeConfigFile, paths.cleanupRuntimeFile].map(fileSnapshot));
+  const snapshots = await Promise.all([paths.cleanupFile, paths.cleanupNativeConfigFile, paths.cleanupRuntimeFile, paths.cleanupCredentialPoolFile].map(fileSnapshot));
   snapshots.forEach(assertManagedScriptSnapshot);
   const quarantined = [];
   try {
@@ -599,7 +619,11 @@ export async function reconcileNativeCleanup(settingsDir, now = Date.now()) {
       let value;
       try { value = JSON.parse(settings.contents); }
       catch { return { reconciled: false, reason: "settings-invalid" }; }
-      if (typeof value?.apiKey === "string" && value.apiKey || typeof value?.model === "string" && value.model) {
+      try { credentialsFromSettingsDocument(value, { defaultBaseUrl: DEFAULT_DEEPSEEK_BASE_URL }); }
+      catch { return { reconciled: false, reason: "settings-invalid" }; }
+      if (typeof value?.apiKey === "string" && value.apiKey ||
+          Array.isArray(value?.credentials) && value.credentials.length > 0 ||
+          typeof value?.model === "string" && value.model) {
         return { reconciled: false, reason: "configured" };
       }
     }
@@ -615,7 +639,7 @@ export async function reconcileNativeCleanup(settingsDir, now = Date.now()) {
 export async function nativeIntegrationStatus(settingsDir, expectedModel = "", expectedDeepseekBaseUrl = "", expectedParentBaseUrl = "") {
   const paths = nativePaths(settingsDir);
   try {
-    const [role, catalog, template, installedRouter, routerSource, config, routerReady, cleanup, nativeConfig, runtime] = await Promise.all([
+    const [role, catalog, template, installedRouter, routerSource, config, routerReady, cleanup, nativeConfig, runtime, installedCredentialPool, credentialPoolSource] = await Promise.all([
       readFile(paths.roleFile, "utf8"),
       readFile(paths.catalogFile, "utf8").then(JSON.parse),
       readFile(fileURLToPath(new URL("../assets/model-template.json", import.meta.url)), "utf8").then(JSON.parse),
@@ -626,6 +650,8 @@ export async function nativeIntegrationStatus(settingsDir, expectedModel = "", e
       readFile(paths.cleanupFile, "utf8"),
       readFile(paths.cleanupNativeConfigFile, "utf8"),
       readFile(paths.cleanupRuntimeFile, "utf8"),
+      readFile(paths.cleanupCredentialPoolFile, "utf8"),
+      readFile(CREDENTIAL_POOL_SOURCE, "utf8"),
     ]);
     const catalogModelIds = Array.isArray(catalog.models) ? catalog.models.map((candidate) => candidate?.slug) : [];
     const expectedCatalog = buildCatalog(catalogModelIds.map((id) => ({ id })), expectedModel, template);
@@ -635,6 +661,7 @@ export async function nativeIntegrationStatus(settingsDir, expectedModel = "", e
       cleanup === await readFile(CLEANUP_SOURCE, "utf8") &&
       nativeConfig === await readFile(NATIVE_CONFIG_SOURCE, "utf8") &&
       runtime === await readFile(RUNTIME_SOURCE, "utf8") &&
+      installedCredentialPool === credentialPoolSource &&
       tomlBooleanSetting(config, ["features", "multi_agent_v2", "enabled"]) === true &&
       routerReady;
     return { ready, rolePath: paths.roleFile };

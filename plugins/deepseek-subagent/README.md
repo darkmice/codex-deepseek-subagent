@@ -15,10 +15,12 @@ DeepSeek Subagent 将 DeepSeek 接入 Codex 原生 `spawn_agent` runtime。child
 
 1. Open **Settings → Integrations → DeepSeek Subagent**.
 2. On macOS, Windows, or Linux, use the Codex binary bundled with the current
-   desktop app (or a matching current CLI release), ensure Codex Multi-Agent v2 is enabled (see below), save
-   the API key and Base URL, refresh the model list, and save the default model. The Base URL defaults to
-   `https://api.deepseek.com/v1/` and may point to an HTTPS Responses-compatible proxy. The list
-   combines DeepSeek `/v1/models` with the multimodal `deepseek-flash` model.
+   desktop app (or a matching current CLI release), ensure Codex Multi-Agent v2 is enabled (see below), add
+   one or more Base URL + API key connections, refresh the model list, and save the default model. Each
+   connection has its own Base URL; new connections default to
+   `https://api.deepseek.com/v1/` and may instead point to an HTTPS Responses-compatible proxy. The list
+   is the intersection available from every currently usable enabled connection and includes the multimodal
+   `deepseek-flash` model when its Responses probe succeeds.
    Saving a model verifies it with a minimal Responses request, starts a
    user-scoped router, and installs a marked loopback provider route. macOS
    uses LaunchAgent; Windows and Linux use an authenticated detached process
@@ -41,8 +43,9 @@ Codex releases reject it in strict config mode. The plugin checks the v2
 prerequisite. Saving a model then changes only a marked provider-routing block
 and preserves the previous provider assignment for restoration.
 
-保存 Base URL、key 和默认模型前，按上面的形式启用 Multi-Agent v2。Base URL 默认是
-`https://api.deepseek.com/v1/`，也可填写兼容 Responses API 的 HTTPS 代理地址；其中
+添加一组或多组 Base URL + API Key 连接并保存默认模型前，按上面的形式启用 Multi-Agent v2。
+每组连接都有自己的 Base URL；新连接默认使用 `https://api.deepseek.com/v1/`，也可填写
+兼容 Responses API 的 HTTPS 代理地址。模型列表取当前可用且已启用连接的交集；其中
 `hide_spawn_agent_metadata = false` 仅用于显示 spawn 元数据，并不是暴露
 `agent_type` 的前置条件。若存在旧的根级配置
 `multi_agent_v2.hide_spawn_agent_metadata`，请删除它。保存后新建一个 Codex 任务。
@@ -125,7 +128,31 @@ primary task's default model.
 
 ## Local data / 本地数据
 
-The API key remains in the platform-specific settings file with private Unix
+The settings page manages an ordered pool of up to eight connections. Every item
+contains its own local label, Base URL, API key, and enabled state; it can be
+disabled, reordered, or removed independently. The same key may be used with
+different endpoints, but an identical Base URL + key pair cannot be duplicated.
+Only `401` (invalid connection) and `402` (insufficient balance) fail over before
+any response bytes are sent. Failover switches the Base URL and API key together.
+`429`, `5xx`, TLS/network failures, and timeouts stay on the current connection,
+and a task that has already succeeded is pinned to its original connection for
+every continuation. This is availability failover, not a way to multiply
+one DeepSeek account's rate limit. Streaming responses are never replayed after
+output begins. Existing schema v1/v2 single-key settings and schema v3 pools with
+a shared Base URL migrate automatically to schema v4 on the next settings write.
+Changing a Base URL replaces that connection's identity, so an already-running
+task can never drift to the edited endpoint.
+
+设置页管理最多 8 个有序连接；每一项都有独立的本机标签、Base URL、API Key 和启用状态，
+并可独立启停、排序或删除。同一个 Key 可以用于不同地址，但完全相同的 Base URL + Key
+组合不能重复。仅 `401`（连接无效）和 `402`（余额不足）会在尚未输出响应字节时切换
+下一组连接，切换时地址和 Key 会一起改变；`429`、`5xx`、TLS/网络失败及超时都停留在
+当前连接。任务首次成功后，其所有续轮固定使用原连接；流式输出开始后不会重放。这是
+可用性故障转移，不会提高同一 DeepSeek 账户的限流额度。旧 schema v1/v2 单 Key 设置与
+schema v3 共享 Base URL 连接池会在下一次设置写入时自动迁移为 schema v4。
+修改 Base URL 会替换该连接的身份，因此已运行任务不会漂移到修改后的地址。
+
+API keys remain in the platform-specific settings file with private Unix
 permissions where supported:
 
 - macOS: `~/Library/Application Support/DeepSeek Subagent/settings.json`
@@ -133,14 +160,15 @@ permissions where supported:
 - Linux: `$XDG_CONFIG_HOME/deepseek-subagent/settings.json`, or
   `~/.config/deepseek-subagent/settings.json`
 
-The Base URL is stored in the same file. It must be an absolute HTTPS URL
-without embedded credentials, query, or fragment; plain HTTP is accepted only
-for loopback testing. Changing it clears the selected model and removes the old
-native route, so refresh and save a model again before starting a new task.
+Each Base URL is stored with its API key in the same file. It must be an absolute
+HTTPS URL without embedded credentials, query, or fragment; plain HTTP is
+accepted only for loopback testing. Adding a connection or changing any Base URL
+clears the selected model and removes the old native route, so refresh and save a
+model again before starting a new task.
 
-Base URL 与 Key 保存在同一设置文件中。它必须是不含内嵌凭据、查询参数或片段的绝对
-HTTPS URL；只有本机回环测试允许 HTTP。修改 Base URL 会清空已选模型并移除旧原生
-路由，之后必须重新刷新并保存模型，再新建任务。
+每个 Base URL 都与对应 API Key 一起保存在同一设置文件中。地址必须是不含内嵌凭据、
+查询参数或片段的绝对 HTTPS URL；只有本机回环测试允许 HTTP。新增连接或修改任何
+Base URL 都会清空已选模型并移除旧原生路由，之后必须重新刷新并保存模型，再新建任务。
 
 If Settings reports that this file is damaged, close Codex, make a private
 backup only if needed, and remove only this `settings.json`. Reopen Settings to
@@ -151,7 +179,7 @@ API key.
 The generated catalog and router state live beside that file. The
 plugin-managed role is `~/.codex/agents/deepseek-subagent.toml` (or the active
 `CODEX_HOME`). Router state is stored beside the settings file. Its macOS
-LaunchAgent and its Windows/Linux detached process are user-scoped. Deleting the key immediately disables DeepSeek,
+LaunchAgent and its Windows/Linux detached process are user-scoped. Deleting all keys immediately disables DeepSeek,
 restores the previous provider assignment for new tasks, and retains parent
 pass-through for already-open routed tasks for up to ten minutes before cleanup.
 Only plugin-managed files are removed; an unmanaged role at the same path is
@@ -160,7 +188,8 @@ applies to the fixed LaunchAgent path and registered service label. On Windows
 and Linux, replacement and shutdown require the matching random local runtime identity.
 
 完整 API key 不会进入仓库、分发包、命令参数、日志或工具返回；它会作为认证信息发送
-给所配置的 DeepSeek API。删除 key 会立即禁用 DeepSeek、为新任务恢复此前 provider，
+给所配置的 DeepSeek API。DeepSeek 响应头会被规范化、错误正文会被替换，成功响应流也会
+在返回 Codex 前检查当前 Key，兼容代理无法把认证值反射进任务输出或日志。删除全部 key 会立即禁用 DeepSeek、为新任务恢复此前 provider，
 并为已打开任务保留最长十分钟的父请求透传；只删除带插件所有权标记的受管原生文件，
 不会覆盖或删除同路径的用户文件。
 
@@ -170,7 +199,9 @@ and Linux, replacement and shutdown require the matching random local runtime id
 
 The router binds only to `127.0.0.1` behind a random capability path. It never
 logs request bodies or authorization headers. ChatGPT authorization is never
-forwarded to DeepSeek. Native routing is supported on macOS, Windows, and Linux.
+forwarded to DeepSeek. DeepSeek response headers are normalized, error bodies
+are replaced, and successful response streams are checked for the active Key
+before returning to Codex. Native routing is supported on macOS, Windows, and Linux.
 The Windows/Linux detached router is recovered automatically on the next
 delegation if its process exits unexpectedly.
 
@@ -245,7 +276,7 @@ credential plus all verified plugin-managed native files. Start a new Codex
 task before uninstalling. Conflicting files with unverifiable ownership are
 left untouched and cause cleanup to fail closed.
 
-卸载前请在设置页点击**删除 Key**，或执行上面的独立清理命令。该脚本与
+卸载前请在设置页点击**删除全部 Key**，或执行上面的独立清理命令。该脚本与
 `settings.json` 同目录安装，即使插件源码已删除仍可运行；请按当前系统使用上方对应
 命令。它会立即停止插件所有的 router 服务或进程、恢复原 provider，并删除凭据及所有
 可验证的受管原生文件。随后新建 Codex 任务再卸载。无法验证所有权的冲突文件会保留，
