@@ -17,10 +17,37 @@ const instanceId = "b".repeat(48);
 const shutdownToken = "c".repeat(48);
 const requests = [];
 const heldResponses = [];
+const removedProviderCapBytes = 128 * 1024 * 1024;
+const providerRequestMaxBytes = removedProviderCapBytes + 8 * 1024 * 1024;
+const providerBufferedMaxBytes = providerRequestMaxBytes * 4;
 let declaredOversizeClosed = false;
 let streamedOversizeClosed = false;
 
 const upstream = createServer(async (request, response) => {
+  const declaredRequestBytes = Number(request.headers["content-length"] || 0);
+  if (request.url.endsWith("/v1/responses") && declaredRequestBytes > removedProviderCapBytes) {
+    let bodyLength = 0;
+    let bodyPrefix = Buffer.alloc(0);
+    for await (const chunk of request) {
+      bodyLength += chunk.length;
+      if (bodyPrefix.length < 4096) bodyPrefix = Buffer.concat([bodyPrefix, chunk.subarray(0, 4096 - bodyPrefix.length)]);
+    }
+    requests.push({
+      path: request.url,
+      authorization: request.headers.authorization,
+      encoding: request.headers["content-encoding"],
+      body: bodyPrefix,
+      bodyLength,
+    });
+    if (request.url.startsWith("/deepseek/")) {
+      response.writeHead(413, { "content-type": "application/json" });
+      response.end('{"error":{"message":"synthetic upstream payload limit"}}');
+    } else {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end('{"status":"completed","ok":true}');
+    }
+    return;
+  }
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks);
@@ -174,6 +201,12 @@ const upstream = createServer(async (request, response) => {
     return;
   }
   if (payload.testMode === "hold") { heldResponses.push(response); return; }
+  if (payload.testMode === "delay-followup") {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"status":"completed","ok":true}');
+    return;
+  }
   if (payload.testMode === "stream") {
     response.writeHead(200, { "content-type": "application/octet-stream" });
     const chunk = Buffer.alloc(1024 * 1024);
@@ -195,12 +228,13 @@ const routerPort = await new Promise((resolvePort, rejectPort) => {
   });
 });
 
-await writeFile(settingsFile, `${JSON.stringify({
+const validSettingsText = `${JSON.stringify({
   schemaVersion: 2,
   revision: 1,
   model: "deepseek-flash",
   apiKey: "deepseek-test-key",
-})}\n`);
+})}\n`;
+await writeFile(settingsFile, validSettingsText);
 const validCatalog = { models: [{ slug: "deepseek-flash", visibility: "hide", priority: 10_000, supported_in_api: true, input_modalities: ["text", "image"], supports_image_detail_original: true }] };
 await writeFile(catalogFile, `${JSON.stringify(validCatalog)}\n`);
 await writeFile(runtimeFile, `${JSON.stringify({
@@ -215,7 +249,13 @@ await writeFile(runtimeFile, `${JSON.stringify({
   selectedModel: "deepseek-flash",
   deepseekBaseUrl: `http://127.0.0.1:${upstreamPort}/deepseek/v1/`,
   parentBaseUrl: `http://127.0.0.1:${upstreamPort}/parent/v1/`,
-  testTiming: { activeIdleTtlMs: 1000, activeAbsoluteTtlMs: 5000 },
+  parentModel: "gpt-parent",
+  testTiming: {
+    activeIdleTtlMs: 1000,
+    activeAbsoluteTtlMs: 5000,
+    providerRequestMaxBytes,
+    providerBufferedMaxBytes,
+  },
 })}\n`);
 
 const router = spawn(process.execPath, [join(root, "plugins/deepseek-subagent/scripts/router.mjs"), runtimeFile], {
@@ -323,6 +363,12 @@ try {
     body: JSON.stringify({ taskName: "../escape", message: "must fail" }),
   });
   assert.equal(invalidPrepare.status, 400);
+  const unreadablePrepare = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/prepare`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: "task1", message: "must fail" }),
+  });
+  assert.equal(unreadablePrepare.status, 400);
   const unsupportedPrepareShape = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/prepare`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -475,6 +521,29 @@ try {
   const jsonContinuedUpstream = JSON.parse(requests.at(-1).body.toString("utf8"));
   assert.equal(jsonContinuedUpstream.input.some((item) => item.id === "reasoning-json" && item.encrypted_content === "cipher-json"), true);
 
+  const compactedJsonContinuation = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "deepseek-flash",
+      previous_response_id: "json-response",
+      testMode: "compacted-continuation-json",
+      input: [{ type: "reasoning", id: "reasoning-json", summary: [], encrypted_content: "cipher-json" },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Compacted task continuation." }] }],
+    }),
+  });
+  assert.equal(compactedJsonContinuation.status, 200, await compactedJsonContinuation.clone().text());
+  const compactedJsonUpstream = JSON.parse(requests.at(-1).body.toString("utf8"));
+  assert.equal(compactedJsonUpstream.previous_response_id, "json-response");
+  assert.equal(JSON.stringify(compactedJsonUpstream).includes("Compacted task continuation."), true);
+
+  const unknownCompactedContinuation = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-flash", previous_response_id: "unknown-response", input: [] }),
+  });
+  assert.equal(unknownCompactedContinuation.status, 409);
+
   const alteredJsonContinuation = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
     method: "POST",
     headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
@@ -606,6 +675,17 @@ try {
   });
   assert.equal(sseContinuation.status, 200);
 
+  const compactedSseContinuation = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "deepseek-flash",
+      previous_response_id: "sse-response",
+      input: [{ type: "reasoning", id: "reasoning-sse", summary: [], encrypted_content: "cipher-sse" }],
+    }),
+  });
+  assert.equal(compactedSseContinuation.status, 200);
+
   const raceStartedAt = Date.now();
   const sseRace = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
     method: "POST",
@@ -732,19 +812,76 @@ try {
   });
   assert.equal(staleDeepSeek.status, 409);
   assert.equal(requests.filter((entry) => entry.path.startsWith("/deepseek/")).length, routedBeforeRejectedRequests);
-  const expansionBomb = gzipSync(Buffer.from(JSON.stringify({ ...encryptedChildPayload, padding: "x".repeat(33 * 1024 * 1024) })));
+  const oversizedPrepare = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/prepare`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: "oversized_probe", message: "Fallback this oversized task to the parent provider." }),
+  });
+  assert.equal(oversizedPrepare.status, 201);
+  const oversizedTask = (await oversizedPrepare.json()).taskName;
+  const oversizedPayload = {
+    ...encryptedChildPayload,
+    model: "gpt-parent",
+    input: [{ ...encryptedChildPayload.input[0], recipient: `/root/${oversizedTask}`, content: [
+      { type: "input_text", text: `Message Type: NEW_TASK\nTask name: /root/${oversizedTask}\nSender: /root\nPayload:\n` },
+      { type: "encrypted_content", encrypted_content: "oversized-envelope" },
+    ] }],
+    padding: "x".repeat(removedProviderCapBytes + 1024),
+  };
+  const expansionBomb = gzipSync(Buffer.from(JSON.stringify(oversizedPayload)));
   const oversized = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
     method: "POST",
     headers: { authorization: "Bearer parent-secret", "content-type": "application/json", "content-encoding": "gzip" },
     body: expansionBomb,
   });
-  assert.equal(oversized.status, 400);
-  assert.equal(requests.filter((entry) => entry.path.startsWith("/deepseek/")).length, routedBeforeRejectedRequests);
+  assert.equal(oversized.status, 200);
+  const oversizedFallback = requests.at(-1);
+  assert.equal(oversizedFallback.path, "/parent/v1/responses");
+  assert.equal(oversizedFallback.authorization, "Bearer parent-secret");
+  assert.equal(oversizedFallback.encoding, undefined);
+  assert(oversizedFallback.bodyLength > removedProviderCapBytes);
+  assert.match(oversizedFallback.body.toString("utf8"), /^\{"model":"gpt-parent"/);
+  const oversizedDeepSeek = requests.at(-2);
+  assert.equal(oversizedDeepSeek.path, "/deepseek/v1/responses");
+  assert.equal(oversizedDeepSeek.authorization, "Bearer deepseek-test-key");
+  assert(oversizedDeepSeek.bodyLength > removedProviderCapBytes);
+  assert.match(oversizedDeepSeek.body.toString("utf8"), /^\{"model":"deepseek-flash"/);
+  assert.equal(requests.filter((entry) => entry.path.startsWith("/deepseek/")).length, routedBeforeRejectedRequests + 1);
 
+  const compressedExpansionBomb = gzipSync(Buffer.from(JSON.stringify({
+    model: "gpt-parent",
+    padding: "z".repeat(providerRequestMaxBytes + 1024),
+  })));
+  const rejectedExpansion = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: "Bearer parent-secret", "content-type": "application/json", "content-encoding": "gzip" },
+    body: compressedExpansionBomb,
+  });
+  assert.equal(rejectedExpansion.status, 413, "A compressed request expanded beyond the dynamic provider request budget.");
+  assert.equal((await rejectedExpansion.json()).error.code, "PROVIDER_REQUEST_TOO_LARGE");
+
+  const concurrencyPrepare = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/prepare`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: "concurrency_probe", message: "Exercise provider concurrency after a large request." }),
+  });
+  assert.equal(concurrencyPrepare.status, 201);
+  const concurrencyTask = (await concurrencyPrepare.json()).taskName;
+  const concurrencyPayload = {
+    ...encryptedChildPayload,
+    input: [{ ...encryptedChildPayload.input[0], recipient: `/root/${concurrencyTask}`, content: [
+      { type: "input_text", text: `Message Type: NEW_TASK\nTask name: /root/${concurrencyTask}\nSender: /root\nPayload:\n` },
+      { type: "encrypted_content", encrypted_content: "concurrency-envelope" },
+    ] }],
+  };
+  const concurrencySeed = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify({ ...concurrencyPayload, testMode: "after-large-seed" }),
+  });
+  assert.equal(concurrencySeed.status, 200);
   const holdRequests = Array.from({ length: 8 }, () => fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
     method: "POST",
     headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
-    body: JSON.stringify({ ...encryptedChildPayload, testMode: "hold" }),
+    body: JSON.stringify({ ...concurrencyPayload, testMode: "hold" }),
   }));
   for (let attempt = 0; attempt < 100 && heldResponses.length < 8; attempt++) {
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
@@ -766,13 +903,13 @@ try {
     });
     request.once("error", (error) => { if (error.code === "ECONNRESET") resolveAbort(); else rejectAbort(error); });
     request.once("response", (response) => { response.destroy(); resolveAbort(); });
-    request.end(JSON.stringify({ ...encryptedChildPayload, testMode: "stream" }));
+    request.end(JSON.stringify({ ...concurrencyPayload, testMode: "stream" }));
   });
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   const afterAbort = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
     method: "POST",
     headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
-    body: JSON.stringify({ ...encryptedChildPayload, testMode: "after-abort" }),
+    body: JSON.stringify({ ...concurrencyPayload, testMode: "after-abort" }),
   });
   assert.equal(afterAbort.status, 200);
   const ttlPrepare = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/prepare`, {
@@ -798,6 +935,129 @@ try {
   assert.equal((await sendTtlRequest()).status, 200, "Second active request did not refresh its idle TTL.");
   await new Promise((resolveDelay) => setTimeout(resolveDelay, 1100));
   assert.equal((await sendTtlRequest()).status, 409, "Expired active task was accepted.");
+
+  const reusePrepare = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/prepare`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: "router_reuse_probe", message: "Remember marker ORCHID-7319." }),
+  });
+  assert.equal(reusePrepare.status, 201);
+  const reuseTask = (await reusePrepare.json()).taskName;
+  const reuseEnvelope = (ciphertext, taskName = reuseTask) => ({
+    type: "agent_message", role: "assistant", content: [
+      { type: "input_text", text: `Message Type: NEW_TASK\nTask name: /root/${taskName}\nSender: /root\nPayload:\n` },
+      { type: "encrypted_content", encrypted_content: ciphertext },
+    ],
+  });
+  const reuseInitialPayload = { model: "deepseek-flash", input: [reuseEnvelope("reuse-first-envelope")] };
+  assert.equal((await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST", headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify(reuseInitialPayload),
+  })).status, 200);
+  const followupMessage = "Return the marker remembered in the previous turn.";
+  const stageFollowup = () => fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/followup`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: `/root/${reuseTask}`, message: followupMessage }),
+  });
+  const stagedFollowup = await stageFollowup();
+  assert.equal(stagedFollowup.status, 201);
+  assert.equal((await stagedFollowup.json()).taskName, reuseTask);
+  assert.equal((await stageFollowup()).status, 409, "A second pending follow-up was accepted.");
+  const followupPayload = {
+    model: "deepseek-flash",
+    input: [reuseEnvelope("reuse-first-envelope"), reuseEnvelope("reuse-second-envelope")],
+  };
+  const followupResponse = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST", headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify(followupPayload),
+  });
+  assert.equal(followupResponse.status, 200);
+  const followupUpstream = JSON.parse(requests.at(-1).body.toString("utf8"));
+  assert.equal(JSON.stringify(followupUpstream).includes("Remember marker ORCHID-7319."), true);
+  assert.equal(JSON.stringify(followupUpstream).includes(followupMessage), true);
+  assert.equal(JSON.stringify(followupUpstream).includes("reuse-first-envelope"), false);
+  assert.equal(JSON.stringify(followupUpstream).includes("reuse-second-envelope"), false);
+  const committedReplayUpstreamCount = requests.length;
+  const committedReplay = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST", headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify(followupPayload),
+  });
+  assert.equal(committedReplay.status, 409, "A committed follow-up retry was executed again.");
+  assert.equal((await committedReplay.json()).error.code, "FOLLOWUP_REQUEST_REPLAYED");
+  assert.equal(requests.length, committedReplayUpstreamCount, "A committed follow-up replay reached an upstream provider.");
+  const concurrentFollowupMessage = "Verify concurrent retry idempotence.";
+  const concurrentStage = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/followup`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: reuseTask, message: concurrentFollowupMessage }),
+  });
+  assert.equal(concurrentStage.status, 201);
+  const concurrentFollowupPayload = {
+    model: "deepseek-flash", testMode: "delay-followup",
+    input: [
+      reuseEnvelope("reuse-first-envelope"),
+      reuseEnvelope("reuse-second-envelope"),
+      reuseEnvelope("reuse-third-envelope"),
+    ],
+  };
+  const concurrentFollowups = await Promise.all([1, 2].map(() =>
+    fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+      method: "POST", headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+      body: JSON.stringify(concurrentFollowupPayload),
+    })));
+  assert.deepEqual(concurrentFollowups.map((response) => response.status).sort(), [200, 409],
+    "Concurrent retries of one prepared follow-up did not deterministically suppress one execution.");
+  const concurrentRejection = concurrentFollowups.find((response) => response.status === 409);
+  assert.equal((await concurrentRejection.json()).error.code, "FOLLOWUP_REQUEST_IN_PROGRESS");
+  assert.equal(requests.filter((entry) => entry.path.startsWith("/deepseek/") &&
+    entry.body.includes?.(concurrentFollowupMessage)).length, 1,
+  "A concurrent follow-up replay reached the upstream provider more than once.");
+  const retryAfterSetupFailureMessage = "Retry after a pre-upstream setup failure.";
+  const retryAfterSetupFailureStage = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/followup`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: reuseTask, message: retryAfterSetupFailureMessage }),
+  });
+  assert.equal(retryAfterSetupFailureStage.status, 201);
+  const retryAfterSetupFailurePayload = {
+    model: "deepseek-flash",
+    input: [
+      reuseEnvelope("reuse-first-envelope"),
+      reuseEnvelope("reuse-second-envelope"),
+      reuseEnvelope("reuse-third-envelope"),
+      reuseEnvelope("reuse-fourth-envelope"),
+    ],
+  };
+  const upstreamCountBeforeSetupFailure = requests.length;
+  let setupFailure;
+  await writeFile(settingsFile, "{invalid-json", "utf8");
+  try {
+    setupFailure = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+      method: "POST", headers: { authorization: "short", "content-type": "application/json" },
+      body: JSON.stringify(retryAfterSetupFailurePayload),
+    });
+  } finally {
+    await writeFile(settingsFile, validSettingsText, "utf8");
+  }
+  assert.equal(setupFailure.status, 401);
+  assert.equal(requests.length, upstreamCountBeforeSetupFailure, "A setup failure unexpectedly reached an upstream provider.");
+  const retriedAfterSetupFailure = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST", headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify(retryAfterSetupFailurePayload),
+  });
+  assert.equal(retriedAfterSetupFailure.status, 200, "A failed pre-upstream follow-up left its single-flight lock stuck.");
+  assert.equal(requests.filter((entry) => entry.path.startsWith("/deepseek/") &&
+    entry.body.includes?.(retryAfterSetupFailureMessage)).length, 1,
+  "Retry after a pre-upstream setup failure did not execute exactly once.");
+  const alteredHistory = { ...followupPayload, input: [
+    reuseEnvelope("altered-first-envelope"), reuseEnvelope("reuse-second-envelope"), reuseEnvelope("reuse-third-envelope"),
+  ] };
+  assert.equal((await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/v1/responses`, {
+    method: "POST", headers: { authorization: "Bearer parent-secret", "content-type": "application/json" },
+    body: JSON.stringify(alteredHistory),
+  })).status, 409, "Altered follow-up history was accepted.");
+  const unboundFollowup = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/followup`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: "not_prepared_deadbeefdeadbeefdeadbeef", message: "must fail" }),
+  });
+  assert.equal(unboundFollowup.status, 409);
 
   const absolutePrepare = await fetch(`http://127.0.0.1:${routerPort}/${routeToken}/delegations/prepare`, {
     method: "POST", headers: { "content-type": "application/json" },
@@ -830,8 +1090,14 @@ try {
   assert.equal(health.deepseekUpstreamResponses, deepseekUpstreamCount);
   assert.equal(health.parentRequests, parentUpstreamCount);
   assert.equal(health.parentUpstreamResponses, parentUpstreamCount);
-  assert.equal(health.delegationsPrepared, 4);
-  assert.equal(health.delegationsInjected, deepseekUpstreamCount);
+  assert.equal(health.delegationsPrepared, 7);
+  assert.equal(health.followupsPrepared, 3);
+  assert.equal(health.delegationsInjected, deepseekUpstreamCount + 1);
+  assert.equal(health.parentFallbackRequests, 1);
+  assert.equal(health.payloadTooLargeFallbacks, 1);
+  assert.equal(health.providerRequestMaxBytes, providerRequestMaxBytes);
+  assert.equal(health.providerBufferedMaxBytes, providerBufferedMaxBytes);
+  assert.equal(health.providerBufferedBytes, 0);
   assert(health.delegationMisses >= 10);
   process.stdout.write("Router model catalog, prepared delegation bridge, payload preservation, compression, and authorization tests passed\n");
 } finally {

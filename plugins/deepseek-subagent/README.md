@@ -57,8 +57,11 @@ provider to a local router because current Codex child-role overrides do not
 carry `model_provider`. Parent requests are forwarded to the upstream resolved
 from the active ChatGPT-authenticated provider with their original
 authorization. When native `spawn_agent` uses `agent_type: "deepseek"`, the
-managed role selects the saved model; requests whose model matches that saved
-model have their authorization replaced and are sent to DeepSeek. Custom
+managed role selects the saved DeepSeek model. The installer also bridges the
+original provider ID to the loopback router, so a reopened task that retains
+that provider ID cannot send `deepseek-*` directly to ChatGPT. The router
+recognizes only the exact prepared task envelope, replaces authorization, and
+sends it to DeepSeek. Custom
 providers with unsupported routing/header fields fail closed.
 
 ## Team orchestration / 团队编排
@@ -99,12 +102,18 @@ For tool continuations, the router keeps only task-scoped HMAC digests of
 reasoning ciphertext observed in a successful DeepSeek JSON or SSE response.
 It accepts that exact ciphertext only for the same task and rejects unknown,
 cross-task, malformed, or misplaced encrypted content before upstream access.
+Unstarted preparations and pending follow-ups expire after at most ten minutes.
+For same-child continuity, bounded plaintext turn history for an active task
+remains only in router memory until 35 minutes idle or two hours absolute,
+whichever comes first, and is never written to settings, runtime state, or logs.
 
 插件不会修改主任务模型。由于当前 Codex 的 child role override 不传递
 `model_provider`，插件会把有效 provider 改为本机路由；父任务携带原授权继续转发到
 当前 provider 解析出的原上游。skill 以 `agent_type: "deepseek"` 调用原生
-`spawn_agent` 后，受管角色选择 DeepSeek 模型；请求模型与该模型一致时，路由替换
-授权并发送到 DeepSeek。无法安全保留路由/header 的自定义 provider 会 fail closed。
+`spawn_agent` 后，受管角色选择已保存的 DeepSeek 模型。安装器也会把原 provider ID
+桥接到 loopback router，因此重新打开后仍保留旧 provider ID 的任务不会把 `deepseek-*`
+直接发给 ChatGPT。router 只识别精确预备的任务 envelope，随后替换授权并发送到 DeepSeek。无法安全保留
+路由/header 的自定义 provider 会 fail closed。
 
 Codex 会按 ChatGPT provider 加密原生协作消息正文。spawn 前，skill 会先调用
 `deepseek_delegation_prepare`，把明确且有界的委派正文交给本地 router；router 只在
@@ -115,6 +124,9 @@ Codex 会按 ChatGPT provider 加密原生协作消息正文。spawn 前，skill
 工具续请求只使用成功 DeepSeek JSON 或 SSE 响应中观察到的、按 task 绑定的 reasoning
 密文 HMAC 摘要；未知、跨 task、畸形或位置错误的加密内容会在出网前被拒绝，router
 不会保存密文原文。
+未启动的预备和待处理 follow-up 最长十分钟后过期。为复用同一 child，active task 的有界
+明文轮次历史只保留在 router 内存中，在空闲 35 分钟或首次预备后两小时（以先到者为准）
+清除，绝不写入设置、运行状态或日志。
 
 The router augments the authenticated parent `/models` response with only the
 selected plugin-generated DeepSeek model entry. This preserves the official
@@ -138,7 +150,15 @@ any response bytes are sent. Failover switches the Base URL and API key together
 and a task that has already succeeded is pinned to its original connection for
 every continuation. This is availability failover, not a way to multiply
 one DeepSeek account's rate limit. Streaming responses are never replayed after
-output begins. Existing schema v1/v2 single-key settings and schema v3 pools with
+output begins. Exact concurrent or already committed follow-up replays are rejected
+before another upstream execution. Provider request buffering is derived from the
+router's V8 heap rather than the model context window: the default single-request
+budget is at least 160 MiB and scales up to 1 GiB, with a separate heap-derived
+global in-flight budget. Compressed inputs are bounded after decompression, and
+`/healthz` reports the active byte budgets.
+If all eligible connections are unavailable, or DeepSeek returns HTTP `413` before output begins, the task
+is permanently rebound to the authenticated parent GPT provider and parent model.
+Existing schema v1/v2 single-key settings and schema v3 pools with
 a shared Base URL migrate automatically to schema v4 on the next settings write.
 Changing a Base URL replaces that connection's identity, so an already-running
 task can never drift to the edited endpoint.
@@ -148,7 +168,11 @@ task can never drift to the edited endpoint.
 组合不能重复。仅 `401`（连接无效）和 `402`（余额不足）会在尚未输出响应字节时切换
 下一组连接，切换时地址和 Key 会一起改变；`429`、`5xx`、TLS/网络失败及超时都停留在
 当前连接。任务首次成功后，其所有续轮固定使用原连接；流式输出开始后不会重放。这是
-可用性故障转移，不会提高同一 DeepSeek 账户的限流额度。旧 schema v1/v2 单 Key 设置与
+可用性故障转移，不会提高同一 DeepSeek 账户的限流额度。完全相同的并发或已提交 follow-up
+会在再次请求上游前被拒绝。provider 的缓冲预算根据 router 的 V8 heap 动态计算，而不是模型
+上下文窗口：默认单请求预算至少 160 MiB、最高 1 GiB，另有独立的全局在途预算；压缩输入按
+解压后大小受限，`/healthz` 会报告当前字节预算。当全部候选连接均不可用，或 DeepSeek 在尚未输出时返回 HTTP `413`，该任务会永久绑定回已认证的
+父级 GPT provider 及其原模型。旧 schema v1/v2 单 Key 设置与
 schema v3 共享 Base URL 连接池会在下一次设置写入时自动迁移为 schema v4。
 修改 Base URL 会替换该连接的身份，因此已运行任务不会漂移到修改后的地址。
 
@@ -231,21 +255,32 @@ checks readiness before staging the exact message, without loading the settings
 UI. The settings tool is used only when the user asks to view or change settings,
 or when preparation reports incomplete setup. Delegation then continues with
 Codex's native collaboration tools. Cross-provider history is not forked;
-the bounded task message is passed explicitly. Cross-provider follow-ups are
-not supported because the current encrypted envelope has no safe per-message
-binding; prepare and spawn a fresh bounded child for additional work. If the
+the bounded task message is passed explicitly. Related work can reuse an idle
+or terminal child: the parent calls `deepseek_followup_prepare` and then
+immediately calls native `followup_task` with the same task path and bounded
+message. The router binds that plaintext turn to the ordered encrypted history
+already committed for the same child. If the binding expired, preparation
+fails closed and the parent prepares one
+replacement child rather than retrying indefinitely. If the
 child's terminal event arrives before the parent calls `wait_agent`, the parent
 uses that result directly. A wait timeout is only a lack of a new mailbox event;
 the parent checks the matching task-tree state before classifying the child as
-failed.
+failed. Within a running child, tool continuations and requests emitted after
+context compaction remain bound through committed reasoning-ciphertext digests
+and a completed DeepSeek `previous_response_id`. The generated model metadata
+declares a 1,000,000-token window and reserves 5% for context management.
 
 新任务中可以直接说“使用原生 DeepSeek 子智能体检查这个项目”。父任务直接调用
 `deepseek_delegation_prepare`；该调用会先检查就绪状态，不会加载设置页。只有
 用户主动查看或修改设置，或预备阶段报告配置未完成时，才使用设置工具。随后以
-Codex 原生协作工具执行委派；跨 provider 不复制历史。当前加密 envelope 没有可安全绑定
-的逐消息标识，因此不支持跨 provider follow-up；追加工作需重新预备并创建新的 child。
+Codex 原生协作工具执行委派；跨 provider 不复制父任务历史。同一会话中的相关工作可复用
+idle 或 terminal 的 child：父任务先调用 `deepseek_followup_prepare`，再立即使用同一 task
+path 和有界正文调用原生 `followup_task`；router 将新正文绑定到同一 child 已提交的有序加密
+历史。若绑定过期则在预备阶段失败关闭，并只创建一个替代 child，不无限重试。
 若 child 的终态事件先于 `wait_agent` 到达，父任务直接使用该结果，不再重复等待；等待
 超时只表示没有新的 mailbox 事件，必须回读对应任务树状态后才能判定失败。
+运行中的 child 在工具续传或上下文压缩后，使用已提交的推理密文摘要和 DeepSeek
+`previous_response_id` 继续绑定；模型目录声明 1,000,000 tokens，并为上下文管理保留 5%。
 
 ## Uninstall / 卸载
 

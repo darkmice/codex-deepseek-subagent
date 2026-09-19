@@ -240,7 +240,7 @@
           en: {
             lead: "Configure DeepSeek for native Codex child tasks. A local loopback router preserves the parent provider and routes requests whose model matches the selected DeepSeek model.", languageAria: "Language", baseUrlAria: "DeepSeek API base URL", newBaseUrlAria: "API base URL for this DeepSeek connection", newKeyLabelAria: "New DeepSeek connection label", newKeyAria: "New DeepSeek API key", modelAria: "DeepSeek model", labelPlaceholder: "Label", baseUrlPlaceholder: "Base URL", apiKeyPlaceholder: "API key",
             connection: "Connections", apiKeys: "Connection pool", baseUrl: "Base URL", keyStorage: "Up to 8 Base URL + API key pairs, stored only in this user's private platform-specific settings file.", configured: "{enabled} enabled / {total} total", missing: "Not configured",
-            credentialPool: "Failover order", credentialPoolHelp: "Each row is one Base URL + API key pair. Requests use enabled connections from top to bottom. Only 401 and 402 move to the next connection; rate limits, server errors, TLS errors, and timeouts do not.",
+            credentialPool: "Failover order", credentialPoolHelp: "Each row is one Base URL + API key pair. Requests use enabled connections from top to bottom. Only 401 and 402 move to the next connection. If none remain, or DeepSeek returns HTTP 413, that task falls back to the parent GPT provider. The plugin adds no provider payload-size limit.",
             addKey: "Add connection", addKeyHelp: "Set a local label, Base URL, and API key. The secret is never shown again.", add: "Add", enabled: "Enabled", labelAria: "Connection label", connectionLabel: "Label", emptyPool: "No connections configured.", moveUp: "Move up", moveDown: "Move down", remove: "Remove", deleteAll: "Delete all connections", removeConfirm: "Remove {label}? The saved secret cannot be recovered.", deleteAllConfirm: "Delete all connections and disable native DeepSeek routing? Saved secrets cannot be recovered.", save: "Save",
             statusReady: "Ready", statusDisabled: "Disabled", statusInvalid: "Invalid", statusExhausted: "Balance low",
             connectionTest: "Connection test", connectionTestHelp: "Refreshes models and tests the selected Responses model with a tiny request.", test: "Test connection",
@@ -262,7 +262,7 @@
           zh: {
             lead: "为 Codex 原生子任务配置 DeepSeek。本机 loopback 路由保留父任务 provider，并把请求模型与所选 DeepSeek 模型一致的请求转发给 DeepSeek。", languageAria: "语言", baseUrlAria: "DeepSeek API 地址", newBaseUrlAria: "此 DeepSeek 连接的 API 地址", newKeyLabelAria: "新 DeepSeek 连接标签", newKeyAria: "新 DeepSeek API Key", modelAria: "DeepSeek 模型", labelPlaceholder: "连接标签", baseUrlPlaceholder: "Base URL", apiKeyPlaceholder: "API Key",
             connection: "连接", apiKeys: "连接池", baseUrl: "Base URL", keyStorage: "最多 8 组 Base URL + API Key，仅保存在当前用户的私有平台设置文件中。", configured: "已启用 {enabled} / 共 {total}", missing: "未配置",
-            credentialPool: "故障转移顺序", credentialPoolHelp: "每一项都是一组 Base URL + API Key。请求按从上到下的顺序使用已启用连接；只有 401 和 402 会切换下一组，限流、服务端错误、TLS 错误和超时都不会切换。",
+            credentialPool: "故障转移顺序", credentialPoolHelp: "每一项都是一组 Base URL + API Key。请求按顺序使用已启用连接；只有 401 和 402 会切换下一组。若已无可用连接或 DeepSeek 返回 HTTP 413，该任务会回退到父级 GPT provider。插件不额外设置 provider payload 大小上限。",
             addKey: "添加连接", addKeyHelp: "填写本机标签、Base URL 和 API Key；密钥保存后不会再次显示。", add: "添加", enabled: "启用", labelAria: "连接标签", connectionLabel: "连接标签", emptyPool: "尚未配置连接。", moveUp: "上移", moveDown: "下移", remove: "删除", deleteAll: "删除全部连接", removeConfirm: "确定删除 {label}？已保存的密钥无法恢复。", deleteAllConfirm: "确定删除全部连接并停用 DeepSeek 原生路由？已保存的密钥无法恢复。", save: "保存",
             statusReady: "可用", statusDisabled: "已停用", statusInvalid: "无效", statusExhausted: "余额不足",
             connectionTest: "连接测试", connectionTestHelp: "刷新模型，并用极小请求测试已选 Responses 模型。", test: "测试连接",
@@ -349,7 +349,7 @@
         async function initializeBridge() {
           if (!bridgeReady) bridgeReady = (async () => {
             const result = await rpcRequest("ui/initialize", {
-              appInfo: { name: "DeepSeek Subagent", version: "0.7.0+codex.20260917054058" },
+              appInfo: { name: "DeepSeek Subagent", version: "0.7.0+codex.20260919103805" },
               appCapabilities: {},
               protocolVersion: PROTOCOL_VERSION,
             }, 8000);

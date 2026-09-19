@@ -24,7 +24,14 @@ const upstream = createServer(async (request, response) => {
   for await (const chunk of request) body += chunk;
   const payload = JSON.parse(body);
   const authorization = request.headers.authorization;
-  seen.push({ mode: payload.testMode, authorization, path: request.url });
+  seen.push({ mode: payload.testMode, authorization, path: request.url, model: payload.model, body: payload });
+  if (request.url === "/parent/v1/responses") {
+    assert.equal(authorization, "Bearer parent-must-not-forward");
+    assert.equal(payload.model, "gpt-parent");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"status":"completed","output":[]}');
+    return;
+  }
   const isA = authorization === `Bearer ${keyA}`;
   const isB = authorization === `Bearer ${keyB}`;
   assert(isA || isB, `Unexpected credential: ${authorization}`);
@@ -97,6 +104,11 @@ const upstream = createServer(async (request, response) => {
     response.end('{"error":{"message":"unavailable"}}');
     return;
   }
+  if (payload.testMode === "fallback-413") {
+    response.writeHead(413, { "content-type": "application/json" });
+    response.end('{"error":{"message":"payload too large"}}');
+    return;
+  }
   if (payload.testMode === "network-drop") {
     request.socket.destroy();
     return;
@@ -137,7 +149,7 @@ await writeFile(catalogFile, `${JSON.stringify({ models: [{ slug: "deepseek-flas
 await writeFile(runtimeFile, `${JSON.stringify({
   schemaVersion: 2, routeToken, instanceId, shutdownToken, executionMode: "direct-test", port: routerPort,
   settingsFile, catalogFile, selectedModel: "deepseek-flash",
-  deepseekBaseUrl: `http://127.0.0.1:${upstreamPort}/v1/`, parentBaseUrl: `http://127.0.0.1:${upstreamPort}/parent/v1/`,
+  deepseekBaseUrl: `http://127.0.0.1:${upstreamPort}/v1/`, parentBaseUrl: `http://127.0.0.1:${upstreamPort}/parent/v1/`, parentModel: "gpt-parent",
 })}\n`);
 
 const router = spawn(process.execPath, [join(root, "plugins/deepseek-subagent/scripts/router.mjs"), runtimeFile], {
@@ -204,9 +216,26 @@ try {
 
   await resetPool(); task = await prepare("all_exhausted");
   response = await invoke(task, "all402");
-  assert.equal(response.status, 402);
-  assert.match(await response.text(), /DeepSeek upstream returned HTTP 402/);
-  assert.deepEqual(attempts("all402"), [`Bearer ${keyA}`, `Bearer ${keyB}`]);
+  assert.equal(response.status, 200); await response.text();
+  assert.deepEqual(attempts("all402"), [`Bearer ${keyA}`, `Bearer ${keyB}`, "Bearer parent-must-not-forward"]);
+  assert.deepEqual(paths("all402"), ["/a/v1/responses", "/b/v1/responses", "/parent/v1/responses"]);
+  response = await invokeWithReasoning(task, "parent-reasoning", "parent-ciphertext");
+  assert.equal(response.status, 200); await response.text();
+  assert.equal(seen.at(-1).path, "/parent/v1/responses");
+  assert.equal(seen.at(-1).body.input.some((item) => item?.encrypted_content === "parent-ciphertext"), true,
+    "A GPT-fallback continuation discarded the parent provider's reasoning state.");
+
+  await resetPool(); task = await prepare("payload_413");
+  response = await invoke(task, "fallback-413");
+  assert.equal(response.status, 200); await response.text();
+  assert.deepEqual(attempts("fallback-413"), [`Bearer ${keyA}`, "Bearer parent-must-not-forward"]);
+
+  revision++;
+  await writeFile(settingsFile, `${JSON.stringify({ schemaVersion: 4, revision, model: "deepseek-flash", credentials: [] })}\n`);
+  task = await prepare("empty_pool");
+  response = await invoke(task, "empty-pool");
+  assert.equal(response.status, 200); await response.text();
+  assert.deepEqual(attempts("empty-pool"), ["Bearer parent-must-not-forward"]);
 
   await resetPool(); task = await prepare("rate_limit");
   response = await invoke(task, "no-switch-429");
@@ -261,12 +290,13 @@ try {
   response = await invoke(task, "pin-success");
   assert.equal(response.status, 200); await response.text();
   response = await invoke(task, "pinned402");
-  assert.equal(response.status, 402); await response.text();
-  assert.deepEqual(attempts("pinned402"), [`Bearer ${keyA}`]);
+  assert.equal(response.status, 200); await response.text();
+  assert.deepEqual(attempts("pinned402"), [`Bearer ${keyA}`, "Bearer parent-must-not-forward"]);
   const seenBeforePinnedCooldown = seen.length;
   response = await invoke(task, "pinned-cooldown");
-  assert.equal(response.status, 503); await response.text();
-  assert.equal(seen.length, seenBeforePinnedCooldown, "A pinned exhausted key was retried before its cooldown expired.");
+  assert.equal(response.status, 200); await response.text();
+  assert.equal(seen.length, seenBeforePinnedCooldown + 1);
+  assert.equal(seen.at(-1).path, "/parent/v1/responses", "A task already bound to GPT retried its exhausted DeepSeek key.");
 
   await resetPool(); task = await prepare("concurrent_binding");
   const firstConcurrent = invoke(task, "concurrent-failover");
@@ -306,8 +336,9 @@ try {
   })}\n`);
   const seenBeforeReplacedPin = seen.length;
   response = await invoke(task, "replaced-pinned-secret");
-  assert.equal(response.status, 503); await response.text();
-  assert.equal(seen.length, seenBeforeReplacedPin, "A pinned task crossed to a replacement credential ID.");
+  assert.equal(response.status, 200); await response.text();
+  assert.equal(seen.length, seenBeforeReplacedPin + 1);
+  assert.equal(seen.at(-1).path, "/parent/v1/responses", "A pinned task crossed to a replacement DeepSeek credential ID.");
   await resetPool();
 
   await resetPool(); task = await prepare("stream_once");
@@ -317,6 +348,9 @@ try {
   assert.equal(seen.some((entry) => entry.authorization === `Bearer ${keyDisabled}`), false);
   const health = await (await fetch(`${base}/healthz`)).json();
   assert(health.deepseekFailovers >= 3);
+  assert(health.parentFallbackRequests >= 7);
+  assert.equal(health.payloadTooLargeFallbacks, 1);
+  assert(health.unavailableCredentialFallbacks >= 4);
   assert.deepEqual(health.credentials.map((credential) => credential.id), ["key_aaaaaaaaaaaaaaaaaaaaaaaa", "key_cccccccccccccccccccccccc", "key_bbbbbbbbbbbbbbbbbbbbbbbb"]);
   assert.equal(JSON.stringify(health).includes(keyA) || JSON.stringify(health).includes(keyB), false);
   process.stdout.write("Router credential failover, pinning, non-retry, stream, and redaction tests passed\n");

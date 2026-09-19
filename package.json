@@ -1,6 +1,6 @@
 {
   "name": "codex-deepseek-subagent",
-  "version": "0.7.0+codex.20260917054058",
+  "version": "0.7.0+codex.20260919103805",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,12 +12,15 @@
     "test:cas": "node tests/runtime-cas.mjs",
     "test:detached": "node tests/detached-lifecycle.mjs",
     "test:native": "node tests/native-spawn-e2e.mjs",
+    "test:native:fallback": "DEEPSEEK_SUBAGENT_TEST_FORCE_413=1 node tests/native-spawn-e2e.mjs",
+    "test:native:legacy": "DEEPSEEK_SUBAGENT_TEST_LEGACY_PARENT=1 node tests/native-spawn-e2e.mjs",
     "test:parent-live": "node tests/parent-router-live.mjs",
     "test:all": "npm test && npm run test:credentials && npm run test:router && npm run test:runtime && npm run test:cas && npm run test:launchagent && npm run test:detached",
     "check:syntax": "node scripts/check-syntax.mjs",
-    "test:release": "npm run test:all && npm run test:native && npm run package && npm run verify:package",
+    "test:release": "npm run test:all && npm run test:native && npm run test:native:fallback && npm run test:native:legacy && npm run package && npm run verify:package",
     "package": "node scripts/package.mjs",
-    "verify:package": "node scripts/verify-package.mjs"
+    "verify:package": "node scripts/verify-package.mjs",
+    "link:local-skills": "node scripts/link-local-skills.mjs"
   },
   "engines": {
     "node": ">=20"

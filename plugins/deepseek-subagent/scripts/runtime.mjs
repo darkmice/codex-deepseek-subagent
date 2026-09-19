@@ -14,6 +14,8 @@ const CONFIG_TOP_BEGIN = "# >>> DeepSeek Subagent provider routing >>>";
 const CONFIG_TOP_END = "# <<< DeepSeek Subagent provider routing <<<";
 const CONFIG_PROVIDER_BEGIN = "# >>> DeepSeek Subagent provider definition >>>";
 const CONFIG_PROVIDER_END = "# <<< DeepSeek Subagent provider definition <<<";
+const CONFIG_BRIDGE_BEGIN = "# >>> DeepSeek Subagent original provider bridge >>>";
+const CONFIG_BRIDGE_END = "# <<< DeepSeek Subagent original provider bridge <<<";
 const LEGACY_BEGIN = "# >>> DeepSeek Subagent managed config >>>";
 const LEGACY_END = "# <<< DeepSeek Subagent managed config <<<";
 const DEFAULT_LAUNCH_AGENT_LABEL = "com.dark.deepseek-subagent-router";
@@ -265,17 +267,23 @@ function managedRoutingState(contents) {
     topEnd: markerCount(contents, CONFIG_TOP_END),
     providerBegin: markerCount(contents, CONFIG_PROVIDER_BEGIN),
     providerEnd: markerCount(contents, CONFIG_PROVIDER_END),
+    bridgeBegin: markerCount(contents, CONFIG_BRIDGE_BEGIN),
+    bridgeEnd: markerCount(contents, CONFIG_BRIDGE_END),
   };
-  const values = Object.values(counts);
-  if (values.every((count) => count === 0)) return { present: false, originalConfigExisted: true };
-  if (!values.every((count) => count === 1)) {
+  const coreValues = [counts.topBegin, counts.topEnd, counts.providerBegin, counts.providerEnd];
+  if (coreValues.every((count) => count === 0) && counts.bridgeBegin === 0 && counts.bridgeEnd === 0) {
+    return { present: false, originalConfigExisted: true };
+  }
+  if (!coreValues.every((count) => count === 1) || counts.bridgeBegin !== counts.bridgeEnd || counts.bridgeBegin > 1) {
     throw new Error("DeepSeek provider routing markers are incomplete or duplicated; refusing to modify Codex config.");
   }
   const top = contents.match(blockPattern(CONFIG_TOP_BEGIN, CONFIG_TOP_END))?.[0];
   const provider = contents.match(blockPattern(CONFIG_PROVIDER_BEGIN, CONFIG_PROVIDER_END))?.[0];
+  const bridge = counts.bridgeBegin === 1 ? contents.match(blockPattern(CONFIG_BRIDGE_BEGIN, CONFIG_BRIDGE_END))?.[0] : "";
   if (!top || !provider) throw new Error("DeepSeek provider routing blocks are malformed; refusing to modify Codex config.");
+  if (counts.bridgeBegin === 1 && !bridge) throw new Error("DeepSeek original provider bridge is malformed; refusing to modify Codex config.");
   const existed = top.match(/^# original_config_existed = (true|false)$/m);
-  return { present: true, top, provider, originalConfigExisted: existed ? existed[1] === "true" : true };
+  return { present: true, top, provider, bridge, originalConfigExisted: existed ? existed[1] === "true" : true };
 }
 
 function tomlString(value) {
@@ -367,12 +375,30 @@ function managedRoutingMetadata(top, provider) {
     `# original_config_existed = (true|false)\\r?\\n` +
     `# inserted_top_separator = (true|false)\\r?\\n` +
     `# original_model_provider_b64 = ([A-Za-z0-9+/=]*)\\r?\\n` +
+    `# provider_bridge_required = true\\r?\\n` +
     `# routing_integrity_sha256 = ([a-f0-9]{64})\\r?\\n` +
     `model_provider = ${escapeRegExp(tomlString(ROUTER_PROVIDER_ID))}\\r?\\n` +
     `${escapeRegExp(CONFIG_TOP_END)}(?:\\r?\\n|$)$`,
   );
   const match = top.match(pattern);
   if (!match) {
+    const priorIntegrityPattern = new RegExp(
+      `^${escapeRegExp(CONFIG_TOP_BEGIN)}\\r?\\n` +
+      `# original_config_existed = (true|false)\\r?\\n` +
+      `# inserted_top_separator = (true|false)\\r?\\n` +
+      `# original_model_provider_b64 = ([A-Za-z0-9+/=]*)\\r?\\n` +
+      `# routing_integrity_sha256 = ([a-f0-9]{64})\\r?\\n` +
+      `model_provider = ${escapeRegExp(tomlString(ROUTER_PROVIDER_ID))}\\r?\\n` +
+      `${escapeRegExp(CONFIG_TOP_END)}(?:\\r?\\n|$)$`,
+    );
+    const prior = top.match(priorIntegrityPattern);
+    if (prior) {
+      const expected = routingIntegrity(prior[1] === "true", prior[2] === "true", prior[3], provider);
+      if (prior[4] !== expected) throw new Error("The managed provider routing metadata failed its integrity check; refusing to modify Codex config.");
+      const original = decodeOriginalProvider(top);
+      validateOriginalProviderMetadata(original, prior[2] === "true");
+      return { format: "integrity-v1", originalConfigExisted: prior[1] === "true", insertedTopSeparator: prior[2] === "true", originalProviderB64: prior[3], original };
+    }
     const legacy = legacyManagedRoutingMetadata(top, provider);
     if (legacy) return legacy;
     throw new Error("The managed provider routing metadata is malformed; refusing to modify Codex config.");
@@ -384,7 +410,7 @@ function managedRoutingMetadata(top, provider) {
   if (match[4] !== expectedIntegrity) throw new Error("The managed provider routing metadata failed its integrity check; refusing to modify Codex config.");
   const original = decodeOriginalProvider(top);
   validateOriginalProviderMetadata(original, insertedTopSeparator);
-  return { format: "integrity", originalConfigExisted, insertedTopSeparator, originalProviderB64, original };
+  return { format: "integrity-v2", originalConfigExisted, insertedTopSeparator, originalProviderB64, original };
 }
 
 function stripManagedRouting(contents) {
@@ -395,6 +421,12 @@ function stripManagedRouting(contents) {
   const top = state.top;
   const provider = state.provider;
   const metadata = managedRoutingMetadata(top, provider);
+  if (metadata.format === "integrity-v2" && !state.bridge) {
+    throw new Error("The managed original provider bridge is missing; refusing to modify Codex config.");
+  }
+  if (metadata.format !== "integrity-v2" && state.bridge) {
+    throw new Error("The managed original provider bridge is not owned by this routing format.");
+  }
   const { original, insertedTopSeparator } = metadata;
   const insertedProviderSeparator = /^# inserted_separator = true$/m.test(provider);
   const topIndex = contents.indexOf(top);
@@ -411,13 +443,16 @@ function stripManagedRouting(contents) {
   let middle = contents.slice(topIndex + top.length, providerIndex);
   const suffix = contents.slice(providerIndex + provider.length);
   let topTerminator = top.endsWith("\r\n") ? "\r\n" : top.endsWith("\n") ? "\n" : "";
-  if (insertedTopSeparator && !suffix) prefix = removeTrailingLineEnding(prefix, "top-level");
+  const deferredTopSeparator = insertedTopSeparator && !suffix && metadata.format === "integrity-v2";
+  if (insertedTopSeparator && !suffix && !deferredTopSeparator) prefix = removeTrailingLineEnding(prefix, "top-level");
   if (insertedProviderSeparator && !suffix) {
     if (middle.endsWith("\n")) middle = removeTrailingLineEnding(middle, "provider");
     else if (!middle && topTerminator) topTerminator = "";
     else throw new Error("The managed provider routing block is missing its recorded provider separator.");
   }
   let next = prefix + (original ? `${original}${topTerminator}` : "") + middle + suffix;
+  next = stripProviderBridge(next, metadata.format === "integrity-v2");
+  if (deferredTopSeparator) next = removeTrailingLineEnding(next, "top-level");
   return stripLegacyManagedConfig(next);
 }
 
@@ -491,6 +526,129 @@ function providerAssignments(contents, providerId) {
   return assignments;
 }
 
+function providerTableRegion(contents, providerId) {
+  let section = [];
+  let region = null;
+  const lines = [...contents.matchAll(/[^\r\n]*(?:\r\n|\n|$)/g)].filter((match) => match[0].length > 0);
+  for (const match of lines) {
+    const raw = match[0];
+    const body = raw.replace(/\r?\n$/, "");
+    const start = match.index;
+    const end = start + raw.length;
+    const table = tomlTablePath(stripTomlComment(body));
+    if (table) {
+      if (region && !sameTomlPath(table.path, ["model_providers", providerId])) {
+        region.end = start;
+        break;
+      }
+      section = table.path;
+      if (sameTomlPath(section, ["model_providers", providerId])) {
+        region = { start, headerEnd: end, end: contents.length, baseLineStart: -1, baseLineEnd: -1, baseLine: "" };
+      }
+      continue;
+    }
+    if (!region || !sameTomlPath(section, ["model_providers", providerId])) continue;
+    const assignment = tomlAssignment(stripTomlComment(body));
+    if (assignment && sameTomlPath(assignment.path, ["base_url"])) {
+      region.baseLineStart = start;
+      region.baseLineEnd = end;
+      region.baseLine = body;
+    }
+  }
+  return region;
+}
+
+function bridgeIntegrity(scope, providerIdB64, originalLineB64, baseUrl) {
+  return createHash("sha256").update(JSON.stringify({ scope, providerIdB64, originalLineB64, baseUrl })).digest("hex");
+}
+
+function providerBridgeBlock(scope, providerId, originalLine, baseUrl, lineEnding = "\n") {
+  const providerIdB64 = Buffer.from(providerId, "utf8").toString("base64");
+  const originalLineB64 = Buffer.from(originalLine, "utf8").toString("base64");
+  const integrity = bridgeIntegrity(scope, providerIdB64, originalLineB64, baseUrl);
+  const key = scope === "provider" ? "base_url" : "chatgpt_base_url";
+  return [
+    CONFIG_BRIDGE_BEGIN,
+    `# scope = ${scope}`,
+    `# provider_id_b64 = ${providerIdB64}`,
+    `# original_base_url_b64 = ${originalLineB64}`,
+    `# bridge_integrity_sha256 = ${integrity}`,
+    `${key} = ${tomlString(baseUrl)}`,
+    CONFIG_BRIDGE_END,
+    "",
+  ].join(lineEnding);
+}
+
+function providerBridgeMetadata(contents) {
+  const block = contents.match(blockPattern(CONFIG_BRIDGE_BEGIN, CONFIG_BRIDGE_END))?.[0];
+  if (!block) throw new Error("The managed original provider bridge is missing or malformed; refusing to modify Codex config.");
+  const pattern = new RegExp(
+    `^${escapeRegExp(CONFIG_BRIDGE_BEGIN)}\\r?\\n` +
+    `# scope = (provider|chatgpt)\\r?\\n` +
+    `# provider_id_b64 = ([A-Za-z0-9+/=]*)\\r?\\n` +
+    `# original_base_url_b64 = ([A-Za-z0-9+/=]*)\\r?\\n` +
+    `# bridge_integrity_sha256 = ([a-f0-9]{64})\\r?\\n` +
+    `(base_url|chatgpt_base_url) = (.+?)\\r?\\n` +
+    `${escapeRegExp(CONFIG_BRIDGE_END)}(?:\\r?\\n|$)$`,
+  );
+  const match = block.match(pattern);
+  if (!match) throw new Error("The managed original provider bridge metadata is malformed; refusing to modify Codex config.");
+  const [scope, providerIdB64, originalLineB64, integrity, key, rawUrl] = match.slice(1);
+  if (key !== (scope === "provider" ? "base_url" : "chatgpt_base_url")) {
+    throw new Error("The managed original provider bridge has an invalid scope; refusing to modify Codex config.");
+  }
+  const providerId = Buffer.from(providerIdB64, "base64").toString("utf8");
+  const originalLine = Buffer.from(originalLineB64, "base64").toString("utf8");
+  if (!providerId || /[\r\n]/.test(providerId) || /[\r\n]/.test(originalLine)) {
+    throw new Error("The managed original provider bridge contains invalid restoration metadata.");
+  }
+  const baseUrl = validateUpstreamBaseUrl(parseTomlString(rawUrl, `${key} bridge`), `${key} bridge`);
+  const expected = bridgeIntegrity(scope, providerIdB64, originalLineB64, baseUrl.replace(/\/$/, ""));
+  const expectedWithSlash = bridgeIntegrity(scope, providerIdB64, originalLineB64, baseUrl);
+  if (integrity !== expected && integrity !== expectedWithSlash) {
+    throw new Error("The managed original provider bridge failed its integrity check; refusing to modify Codex config.");
+  }
+  const blockIndex = contents.indexOf(block);
+  if (scope === "provider") {
+    const region = providerTableRegion(contents, providerId);
+    if (!region || blockIndex < region.headerEnd || blockIndex >= region.end) {
+      throw new Error("The managed original provider bridge is outside its provider table.");
+    }
+  } else if (/^\s*\[/m.test(contents.slice(0, blockIndex))) {
+    throw new Error("The managed ChatGPT provider bridge is not top-level.");
+  }
+  return { block, scope, providerId, originalLine, baseUrl };
+}
+
+function installProviderBridge(contents, providerId, baseUrl) {
+  const lineEnding = contents.includes("\r\n") ? "\r\n" : "\n";
+  if (providerId === "openai") {
+    const assignment = topLevelAssignment(contents, "chatgpt_base_url");
+    const originalLine = assignment?.line || "";
+    const block = providerBridgeBlock("chatgpt", providerId, originalLine, baseUrl, lineEnding);
+    if (assignment) return contents.replace(assignment.line, block.replace(/\r?\n$/, ""));
+    const firstTable = contents.search(/^\s*\[/m);
+    return firstTable < 0 ? `${contents}${contents && !contents.endsWith(lineEnding) ? lineEnding : ""}${block}` : `${contents.slice(0, firstTable)}${block}${contents.slice(firstTable)}`;
+  }
+  const region = providerTableRegion(contents, providerId);
+  if (!region) throw new Error(`The current Codex provider (${providerId}) table could not be bridged safely.`);
+  const block = providerBridgeBlock("provider", providerId, region.baseLine, baseUrl, lineEnding);
+  if (region.baseLineStart >= 0) return contents.slice(0, region.baseLineStart) + block + contents.slice(region.baseLineEnd);
+  return contents.slice(0, region.headerEnd) + block + contents.slice(region.headerEnd);
+}
+
+function stripProviderBridge(contents, required = false) {
+  const count = markerCount(contents, CONFIG_BRIDGE_BEGIN);
+  if (count === 0) {
+    if (required) throw new Error("The managed original provider bridge is missing; refusing to modify Codex config.");
+    return contents;
+  }
+  const metadata = providerBridgeMetadata(contents);
+  const lineEnding = metadata.block.endsWith("\r\n") ? "\r\n" : metadata.block.endsWith("\n") ? "\n" : "";
+  const restored = metadata.originalLine ? `${metadata.originalLine}${lineEnding}` : "";
+  return contents.replace(metadata.block, restored);
+}
+
 function validateUpstreamBaseUrl(value, label) {
   let url;
   try { url = new URL(value); }
@@ -522,6 +680,16 @@ function parentProviderBaseUrl(contents, providerId) {
   }
   const configured = assignments.get("base_url");
   return configured ? validateUpstreamBaseUrl(parseTomlString(configured, `${providerId}.base_url`), `${providerId}.base_url`) : defaultChatGptBase;
+}
+
+function configuredParentModel(contents) {
+  const assignment = topLevelAssignment(contents, "model");
+  if (!assignment) return "";
+  const model = parseTomlString(assignment.value, "model");
+  if (!model || Buffer.byteLength(model, "utf8") > 128 || /[\u0000-\u001f\u007f]/.test(model) || model.startsWith("deepseek-")) {
+    throw new Error("The current Codex parent model cannot be used for safe DeepSeek fallback.");
+  }
+  return model;
 }
 
 function assertNoProfileProviderOverrides(contents) {
@@ -595,18 +763,19 @@ export function installRouterConfig(contents, baseUrl, { originalConfigExisted =
   const firstTable = assignment ? -1 : next.search(/^\s*\[/m);
   const insertedTopSeparator = !assignment && firstTable < 0 && next.length > 0 && !next.endsWith("\n");
   const integrityPlaceholder = "0".repeat(64);
-  const topBlock = `${CONFIG_TOP_BEGIN}\n# original_config_existed = ${effectiveOriginalConfigExisted}\n# inserted_top_separator = ${insertedTopSeparator}\n# original_model_provider_b64 = ${encoded}\n# routing_integrity_sha256 = ${integrityPlaceholder}\nmodel_provider = ${tomlString(ROUTER_PROVIDER_ID)}\n${CONFIG_TOP_END}\n`;
+  const topBlock = `${CONFIG_TOP_BEGIN}\n# original_config_existed = ${effectiveOriginalConfigExisted}\n# inserted_top_separator = ${insertedTopSeparator}\n# original_model_provider_b64 = ${encoded}\n# provider_bridge_required = true\n# routing_integrity_sha256 = ${integrityPlaceholder}\nmodel_provider = ${tomlString(ROUTER_PROVIDER_ID)}\n${CONFIG_TOP_END}\n`;
   const insertedTopBlock = assignment ? topBlock.trimEnd() : topBlock;
   if (assignment) next = next.replace(assignment.line, insertedTopBlock);
   else {
     next = firstTable < 0 ? `${next}${insertedTopSeparator ? "\n" : ""}${insertedTopBlock}` : `${next.slice(0, firstTable)}${insertedTopBlock}${next.slice(firstTable)}`;
   }
+  next = installProviderBridge(next, originalProviderId, baseUrl);
   const insertedSeparator = !next.endsWith("\n");
   const provider = providerBlock(baseUrl, insertedSeparator);
   const integrity = routingIntegrity(effectiveOriginalConfigExisted, insertedTopSeparator, encoded, provider);
   next = next.replace(insertedTopBlock, insertedTopBlock.replace(integrityPlaceholder, integrity));
   next = `${next}${insertedSeparator ? "\n" : ""}${provider}`;
-  return { contents: next, originalProviderId, parentBaseUrl };
+  return { contents: next, originalProviderId, parentBaseUrl, parentModel: configuredParentModel(clean) };
 }
 
 export function removeRouterConfig(contents) {
@@ -617,7 +786,9 @@ export function routerConfigActive(contents, baseUrl) {
   try {
     const state = managedRoutingState(contents);
     if (!state.present) return false;
-    if (managedRoutingMetadata(state.top, state.provider).format !== "integrity") return false;
+    if (managedRoutingMetadata(state.top, state.provider).format !== "integrity-v2") return false;
+    const bridge = providerBridgeMetadata(contents);
+    if (bridge.baseUrl !== validateUpstreamBaseUrl(baseUrl, "router bridge base_url")) return false;
     const insertedSeparator = /^# inserted_separator = (true|false)$/m.exec(state.provider)?.[1];
     if (!insertedSeparator || state.provider !== providerBlock(baseUrl, insertedSeparator === "true")) return false;
     const clean = stripManagedRouting(contents);
@@ -1460,6 +1631,7 @@ async function installRuntimeRouterUnlocked({ paths, routerSourceFile, nodeExecu
   runtime.parentBaseUrl = parentBaseUrl
     ? validateUpstreamBaseUrl(parentBaseUrl, "DeepSeek parent test override")
     : routedConfig.parentBaseUrl;
+  if (routedConfig.parentModel) runtime.parentModel = routedConfig.parentModel;
   try {
     await atomicWrite(paths.routerFile, await readFile(routerSourceFile, "utf8"));
     await atomicWrite(paths.runtimeFile, `${JSON.stringify(runtime, null, 2)}\n`);

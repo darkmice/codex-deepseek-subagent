@@ -6,6 +6,7 @@ const original = `model = "gpt-5.6-sol"\nmodel_provider = "custom"\n\n[model_pro
 const installed = installRouterConfig(original, baseUrl);
 assert.equal(installed.originalProviderId, "custom");
 assert.equal(installed.parentBaseUrl, "https://chatgpt.com/backend-api/codex/");
+assert.equal(installed.parentModel, "gpt-5.6-sol");
 assert(routerConfigActive(installed.contents, baseUrl));
 assert.equal(removeRouterConfig(installed.contents), original);
 
@@ -217,7 +218,10 @@ for (const mutate of [
   assert.throws(() => removeRouterConfig(mutate(installRouterConfig('model = "gpt-parent"', baseUrl).contents)), /integrity check/);
 }
 
-const legacyWithSeparatorMetadata = installed.contents.replace(/^# routing_integrity_sha256 = .*\n/m, "");
+const legacyWithSeparatorMetadata = installed.contents
+  .replace(/^# provider_bridge_required = true\n/m, "")
+  .replace(/^# routing_integrity_sha256 = .*\n/m, "")
+  .replace(/^# >>> DeepSeek Subagent original provider bridge >>>\n[\s\S]*?^# <<< DeepSeek Subagent original provider bridge <<<\n/m, "");
 assert.equal(routerConfigActive(legacyWithSeparatorMetadata, baseUrl), false);
 assert.equal(removeRouterConfig(legacyWithSeparatorMetadata), original);
 assert(routerConfigActive(installRouterConfig(legacyWithSeparatorMetadata, baseUrl).contents, baseUrl));

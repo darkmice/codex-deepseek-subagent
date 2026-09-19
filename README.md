@@ -106,8 +106,11 @@ DeepSeek；GPT 在报告完成前必须检查真实产物并重新验证。
 The native routing integration supports macOS, Windows, and Linux and requires
 a current Codex release with custom agents and native subagent workflows. The effective
 provider becomes a loopback router: parent requests are forwarded to the
-upstream resolved from the active ChatGPT-authenticated provider, while
-requests whose model matches the selected DeepSeek model are sent to DeepSeek.
+upstream resolved from the active ChatGPT-authenticated provider. The installer
+also bridges the original provider ID to the same router, so reopened tasks that
+still retain that provider ID cannot send `deepseek-*` directly to ChatGPT. The
+native role selects the saved DeepSeek model; only a request carrying the exact
+prepared task envelope is authorized and sent to DeepSeek.
 Because Codex encrypts native collaboration message bodies for its ChatGPT
 provider, the skill first uses the plugin's local control-plane tool to stage
 the explicit DeepSeek delegation message in bounded, short-lived router memory.
@@ -123,9 +126,21 @@ Tool continuations remain bound to that same task: the router records only
 in-memory HMAC digests of reasoning ciphertext observed in a successful
 DeepSeek response, then accepts only the matching ciphertext in the next
 request. It never stores the ciphertext itself; unknown, cross-task, malformed,
-or misplaced encrypted content is rejected before any upstream request.
-Current encrypted follow-up envelopes do not expose a safe per-message binding,
-so additional work is delegated by preparing and spawning a fresh bounded child.
+or misplaced encrypted content is rejected before any upstream request. If
+Codex context compaction removes the original task envelope, the continuation
+must carry a `previous_response_id` whose HMAC binding was committed from a
+completed DeepSeek response. The generated model catalog declares a
+1,000,000-token context window and reserves 5% for context management.
+Related work can reuse an idle or terminal DeepSeek child. The parent first
+calls `deepseek_followup_prepare`, then immediately calls native
+`followup_task` with the same task path and message. The router binds the new
+plaintext turn to the ordered encrypted history already committed for that
+child. If that in-memory binding has expired, preparation fails closed and the
+parent prepares one replacement child instead of retrying indefinitely.
+Unstarted preparations and pending follow-ups expire after at most ten minutes.
+For continuity, an active task's bounded plaintext turn history remains only in
+router memory until 35 minutes idle or two hours absolute, whichever comes
+first; it is never written to settings, runtime state, or logs.
 Native child completion can race with the parent's next `wait_agent` call. If a
 matching terminal event has already arrived, the parent consumes it without
 waiting again. A wait timeout only means no new mailbox event arrived during
@@ -145,13 +160,22 @@ router switches both endpoint and key to the next enabled item. It deliberately 
 `5xx`, TLS/network errors, or timeouts: DeepSeek rate limits are account-scoped,
 and replaying ambiguous failures can duplicate work. Once a task succeeds on a
 connection, all of its tool continuations stay pinned to that same connection;
-streaming output is never replayed after it starts. Existing schema v1/v2 single-key
+streaming output is never replayed after it starts. Exact concurrent or already
+committed follow-up replays are rejected before another upstream execution. Provider
+request buffering is derived from the router's V8 heap rather than the model context
+window: the default single-request budget is at least 160 MiB and scales up to 1 GiB,
+with a separate heap-derived global in-flight budget. Compressed inputs are bounded
+after decompression, and `/healthz` reports the active byte budgets. If every eligible connection is unavailable, or
+DeepSeek returns HTTP `413` before output begins, that task is permanently rebound to the
+authenticated parent GPT provider and its original parent model. Existing schema v1/v2 single-key
 settings and schema v3 shared-Base-URL pools migrate locally to schema v4 on the
 next settings write without exposing the secret.
 
 原生路由支持 macOS、Windows 与 Linux，并依赖支持 custom agents 与原生 subagent
 workflow 的新版 Codex。生效后的 provider 是本机 loopback router：父任务转发至当前 provider
-解析出的原上游；请求模型与所选 DeepSeek 模型一致时才会发往 DeepSeek。若自定义
+解析出的原上游；安装器也会把原 provider ID 桥接到同一路由，因此重新打开后仍保留旧
+provider ID 的任务不会把 `deepseek-*` 直接发给 ChatGPT。原生 role 选择已保存的 DeepSeek
+模型，只有携带精确预备任务 envelope 的请求才会获准发往 DeepSeek。若自定义
 provider 含无法安全保留的路由或 header 字段，插件会拒绝启用，不会静默改变数据出口。
 Codex 会按 ChatGPT provider 加密原生协作消息正文，因此 skill 会先通过插件的本地
 控制面工具，把明确的 DeepSeek 委派消息短暂放入有容量与时限的 router 内存。
@@ -163,8 +187,16 @@ router 返回随机唯一任务名，skill 随即把同一任务名与正文交�
 工具续请求仍绑定同一 task：router 只在内存中记录成功 DeepSeek 响应里 reasoning
 密文的 HMAC 摘要，下一次请求仅接受同一 task 已观察到的密文。router 不保存密文原文；
 未知、跨 task、畸形或位置错误的加密内容会在出网前被拒绝。
-当前加密 follow-up envelope 没有可安全绑定的逐消息标识；追加工作需重新预备并创建
-新的有界 child。
+若 Codex 上下文压缩移除了原始任务 envelope，续传请求必须携带已由成功 DeepSeek 响应
+提交 HMAC 绑定的 `previous_response_id`。模型目录声明 1,000,000 tokens，并为上下文
+管理保留 5%。
+同一会话中的相关工作可复用 idle 或 terminal 的 DeepSeek child：父任务先调用
+`deepseek_followup_prepare` 暂存新的有界正文，再立即用同一 task path 和正文调用原生
+`followup_task`；router 将新正文绑定到该 child 已提交的有序加密历史。若内存绑定已经过期，
+预备阶段会失败关闭，父任务只创建一个替代 child，不做无限重试。
+未启动的预备和待处理 follow-up 最长十分钟后过期；为保持连续性，active task 的有界明文
+轮次历史只保留在 router 内存中，在空闲 35 分钟或首次预备后两小时（以先到者为准）清除，
+绝不写入设置、运行状态或日志。
 原生 child 可能在父任务下一次调用 `wait_agent` 前已经完成。若对应终态事件已经到达，
 父任务直接收口，不再重复等待；等待超时只表示该时间段没有新的 mailbox 事件，报告失败
 前必须回读任务树中的真实状态。
@@ -177,7 +209,12 @@ Base URL + API Key。模型发现取当前可用且已启用连接的模型交�
 地址和 Key 一起切换到下一个已启用连接；
 `429`、`5xx`、TLS/网络错误和超时不会切换，因为 DeepSeek 限流按账户计算，重放不确定
 失败还可能重复执行。任务一旦用某组连接成功，其工具续轮就固定使用同一组 Base URL
-和 Key；流式输出开始后绝不重放。旧 schema v1/v2 单 Key 配置与 schema v3 共享地址
+和 Key；流式输出开始后绝不重放，完全相同的并发或已提交 follow-up 会在再次请求上游前被拒绝。
+provider 的缓冲预算根据 router 的 V8 heap 动态计算，而不是模型上下文窗口：默认单请求预算
+至少 160 MiB、最高 1 GiB，另有独立的全局在途预算；压缩输入按解压后大小受限，`/healthz`
+会报告当前字节预算。
+当全部候选连接均不可用，或 DeepSeek 在尚未输出时返回 HTTP `413`，该任务会永久绑定回已认证的
+父级 GPT provider 及其原模型。旧 schema v1/v2 单 Key 配置与 schema v3 共享地址
 连接池会在下一次设置写入时迁移为 schema v4，不暴露密钥。
 
 The loopback router binds only to `127.0.0.1`, never logs request bodies or
@@ -268,6 +305,23 @@ the API key.
 不得分享。
 
 ## Package / 打包
+
+For local development, the two installed skills can track this checkout
+directly while the MCP server and assets remain managed by the normal plugin
+installation:
+
+```text
+npm run link:local-skills
+```
+
+This replaces only the installed cache copies of `deepseek-team` and
+`deepseek-subagent` with directory links to this repository. Run it again after
+installing a new cache-busted plugin version, then start a new Codex task.
+
+本地开发时，可让两个已安装 Skill 直接跟随当前 checkout，同时继续由正常插件安装管理
+MCP server 与资源文件：运行 `npm run link:local-skills`。该命令只把安装缓存中的
+`deepseek-team` 和 `deepseek-subagent` 替换为指向本仓库的目录软链接。安装新的
+cache-busted 版本后需再运行一次，然后新建 Codex 任务加载。
 
 From the repository root, run:
 

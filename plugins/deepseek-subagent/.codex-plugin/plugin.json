@@ -1,6 +1,6 @@
 {
   "name": "deepseek-subagent",
-  "version": "0.7.0+codex.20260917054058",
+  "version": "0.7.0+codex.20260919103805",
   "description": "Route selected DeepSeek models through native Codex child tasks with live output.",
   "author": {
     "name": "dark"

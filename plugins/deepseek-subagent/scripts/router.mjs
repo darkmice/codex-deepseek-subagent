@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
+import { getHeapStatistics } from "node:v8";
 import { brotliDecompress, gunzip, inflate } from "node:zlib";
 import { CredentialRuntimePool, credentialsFromSettingsDocument, failoverReason } from "./credential-pool.mjs";
 
@@ -12,6 +13,10 @@ const requiredRuntimeFields = [
   "routeToken", "instanceId", "shutdownToken", "executionMode", "port", "settingsFile", "catalogFile",
   "selectedModel", "deepseekBaseUrl", "parentBaseUrl",
 ];
+function validParentModel(value) {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 128 &&
+    !/[\u0000-\u001f\u007f]/.test(value) && !value.startsWith("deepseek-");
+}
 function validateRuntime(runtime) {
   if (runtime?.schemaVersion !== 2 || requiredRuntimeFields.some((field) => !runtime[field])) {
     throw new Error("DeepSeek router runtime file is invalid.");
@@ -23,6 +28,7 @@ function validateRuntime(runtime) {
     throw new Error("DeepSeek router endpoint configuration is invalid.");
   }
   if (!/^deepseek-[A-Za-z0-9][A-Za-z0-9._:/-]{0,118}$/.test(runtime.selectedModel)) throw new Error("DeepSeek router model is invalid.");
+  if (runtime.parentModel !== undefined && !validParentModel(runtime.parentModel)) throw new Error("DeepSeek router parent model is invalid.");
   for (const field of ["deepseekBaseUrl", "parentBaseUrl"]) {
     const url = new URL(runtime[field]);
     if (!["http:", "https:"].includes(url.protocol)) throw new Error("DeepSeek router upstream URL is invalid.");
@@ -35,6 +41,7 @@ function validateRuntime(runtime) {
 }
 async function loadRuntime() { return validateRuntime(JSON.parse(await readFile(runtimeFile, "utf8"))); }
 const initialRuntime = await loadRuntime();
+let lastParentModel = validParentModel(initialRuntime.parentModel) ? initialRuntime.parentModel : "";
 // Schema v1/v2 settings do not carry a per-connection endpoint. During their
 // read-only migration, preserve the endpoint that created this router instead
 // of silently falling back to the public DeepSeek service.
@@ -44,17 +51,33 @@ const testTiming = process.env.NODE_ENV === "test" && initialRuntime?.testTiming
   : {};
 
 const routePrefix = `/${initialRuntime.routeToken}/v1`;
-const maxRequestBytes = 32 * 1024 * 1024;
-const maxBufferedBytes = 64 * 1024 * 1024;
 const maxModelsResponseBytes = 8 * 1024 * 1024;
 const maxConcurrentRequests = 8;
 const maxCredentialControlBytes = 4 * 1024;
+const mebibyte = 1024 * 1024;
+const heapLimitBytes = getHeapStatistics().heap_size_limit;
+const derivedProviderRequestBytes = Math.max(160 * mebibyte, Math.min(1024 * mebibyte, Math.floor(heapLimitBytes / 8)));
+const maxProviderRequestBytes = Number.isSafeInteger(testTiming.providerRequestMaxBytes) &&
+    testTiming.providerRequestMaxBytes > 128 * mebibyte
+  ? testTiming.providerRequestMaxBytes
+  : derivedProviderRequestBytes;
+const derivedProviderBufferedBytes = Math.max(maxProviderRequestBytes, Math.min(
+  2 * 1024 * mebibyte,
+  Math.floor(heapLimitBytes / 4),
+));
+const maxProviderBufferedBytes = Number.isSafeInteger(testTiming.providerBufferedMaxBytes) &&
+    testTiming.providerBufferedMaxBytes >= maxProviderRequestBytes
+  ? testTiming.providerBufferedMaxBytes
+  : derivedProviderBufferedBytes;
 const upstreamHeaderTimeoutMs = 60_000;
 const upstreamIdleTimeoutMs = 120_000;
 const upstreamOverallTimeoutMs = 30 * 60_000;
 const maxDelegationMessageBytes = 512 * 1024;
 const maxDelegationControlBytes = maxDelegationMessageBytes * 6 + 4096;
 const maxDelegationRecords = 64;
+const maxDelegationMessagesPerTask = 256;
+const maxDelegationMessageBytesPerTask = 32 * 1024 * 1024;
+const maxDelegationMessageBytesGlobal = 128 * 1024 * 1024;
 const delegationTtlMs = 10 * 60_000;
 const activeDelegationIdleTtlMs = Number.isInteger(testTiming.activeIdleTtlMs) && testTiming.activeIdleTtlMs >= 100
   ? testTiming.activeIdleTtlMs
@@ -64,17 +87,21 @@ const activeDelegationAbsoluteTtlMs = Number.isInteger(testTiming.activeAbsolute
   : 2 * 60 * 60_000;
 const maxReasoningDigestsPerTask = 128;
 const maxReasoningDigestsGlobal = 1024;
+const maxResponseIdDigestsPerTask = 512;
+const maxResponseIdDigestsGlobal = 4096;
 const maxProvenanceItemBytes = 1024 * 1024;
 const maxSseEventBytes = 2 * 1024 * 1024;
 const maxJsonTopLevelStringBytes = 256;
 const maxJsonNestingDepth = 256;
 let activeRequests = 0;
-let bufferedBytes = 0;
+let bufferedControlBytes = 0;
+let bufferedProviderBytes = 0;
 const provenanceKey = randomBytes(32);
 const counters = {
   parentRequests: 0, parentUpstreamResponses: 0, deepseekRequests: 0, deepseekUpstreamResponses: 0,
   deepseekAttempts: 0, deepseekFailovers: 0,
-  delegationsPrepared: 0, delegationsInjected: 0, delegationMisses: 0,
+  parentFallbackRequests: 0, payloadTooLargeFallbacks: 0, unavailableCredentialFallbacks: 0,
+  delegationsPrepared: 0, followupsPrepared: 0, delegationsInjected: 0, delegationMisses: 0,
 };
 const delegationRecords = new Map();
 const credentialPool = new CredentialRuntimePool();
@@ -89,46 +116,96 @@ function routerError(code, message, statusCode) {
   return Object.assign(new Error(message), { code, statusCode });
 }
 
-async function readRequestBody(request, limit = maxRequestBytes) {
+async function readRequestBody(request, limit = null) {
   const chunks = [];
   let size = 0;
   let reservedBytes = 0;
+  const bounded = Number.isSafeInteger(limit) && limit >= 0;
   try {
     for await (const chunk of request) {
       size += chunk.length;
-      if (size > limit) throw Object.assign(new Error("Request body is too large."), { statusCode: 413 });
-      if (bufferedBytes + chunk.length > maxBufferedBytes) {
-        throw Object.assign(new Error("Router request buffer budget is exhausted."), { statusCode: 503 });
+      if (bounded && size > limit) throw Object.assign(new Error("Request body is too large."), { statusCode: 413 });
+      if (bounded) {
+        bufferedControlBytes += chunk.length;
+        reservedBytes += chunk.length;
       }
-      bufferedBytes += chunk.length;
-      reservedBytes += chunk.length;
       chunks.push(chunk);
     }
     return { body: Buffer.concat(chunks), reservedBytes };
   } catch (error) {
-    bufferedBytes -= reservedBytes;
+    bufferedControlBytes -= reservedBytes;
     throw error;
   }
 }
 
-async function decodeJsonBody(body, contentEncoding) {
+function reserveProviderBytes(bytes, reservation) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new TypeError("Provider byte reservation is invalid.");
+  if (bufferedProviderBytes + bytes > maxProviderBufferedBytes) {
+    throw routerError("PROVIDER_BUFFER_CAPACITY", "Provider request buffering capacity is exhausted.", 503);
+  }
+  bufferedProviderBytes += bytes;
+  reservation.bytes += bytes;
+}
+
+function releaseProviderBytes(bytes, reservation) {
+  const released = Math.min(bytes, reservation.bytes, bufferedProviderBytes);
+  reservation.bytes -= released;
+  bufferedProviderBytes -= released;
+}
+
+async function readProviderRequestBody(request, reservation) {
+  const declaredLength = Number(request.headers["content-length"]);
+  if (Number.isFinite(declaredLength) && declaredLength > maxProviderRequestBytes) {
+    request.resume();
+    throw routerError("PROVIDER_REQUEST_TOO_LARGE", "Provider request body exceeds the memory-safe request budget.", 413);
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > maxProviderRequestBytes) {
+      throw routerError("PROVIDER_REQUEST_TOO_LARGE", "Provider request body exceeds the memory-safe request budget.", 413);
+    }
+    reserveProviderBytes(chunk.length, reservation);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function decodeJsonBody(body, contentEncoding, reservation) {
   const encoding = String(contentEncoding || "identity").trim().toLowerCase();
   if (encoding === "" || encoding === "identity") return body;
   if (encoding.includes(",") || !decompress[encoding]) {
     throw Object.assign(new Error("Unsupported provider request content encoding."), { statusCode: 415 });
   }
+  const outputBudget = Math.min(maxProviderRequestBytes, maxProviderBufferedBytes - bufferedProviderBytes);
+  const constrainedByGlobalBudget = outputBudget < maxProviderRequestBytes;
+  if (outputBudget < 1) {
+    throw routerError("PROVIDER_BUFFER_CAPACITY", "Provider request decompression capacity is exhausted.", 503);
+  }
+  reserveProviderBytes(outputBudget, reservation);
   try {
-    return await decompress[encoding](body, { maxOutputLength: maxRequestBytes });
-  } catch {
-    throw Object.assign(new Error("Provider request body could not be decompressed safely."), { statusCode: 400 });
+    const decoded = await decompress[encoding](body, { maxOutputLength: outputBudget });
+    releaseProviderBytes(outputBudget - decoded.length, reservation);
+    return decoded;
+  } catch (error) {
+    releaseProviderBytes(outputBudget, reservation);
+    if (error?.code === "ERR_BUFFER_TOO_LARGE") {
+      if (constrainedByGlobalBudget) {
+        throw routerError("PROVIDER_BUFFER_CAPACITY", "Provider request decompression capacity is temporarily exhausted.", 503);
+      }
+      throw routerError("PROVIDER_REQUEST_TOO_LARGE", "Provider request decompression exceeds the memory-safe request budget.", 413);
+    }
+    throw Object.assign(new Error("Provider request body could not be decompressed."), { statusCode: 400 });
   }
 }
 
-function parentHeaders(requestHeaders, modelsRequest = false) {
+function parentHeaders(requestHeaders, modelsRequest = false, bodyRewritten = false) {
   const headers = new Headers();
   const modelConditionHeaders = new Set(["if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "range"]);
   for (const [name, rawValue] of Object.entries(requestHeaders)) {
     if (["host", "content-length", "connection", "accept-encoding"].includes(name)) continue;
+    if (bodyRewritten && name === "content-encoding") continue;
     if (modelsRequest && modelConditionHeaders.has(name)) continue;
     const values = Array.isArray(rawValue) ? rawValue : [rawValue];
     for (const value of values) if (typeof value === "string") headers.append(name, value);
@@ -156,6 +233,10 @@ function taskLeaf(value) {
 
 function pruneDelegations(now = Date.now()) {
   for (const [task, record] of delegationRecords) {
+    if (record.pendingFollowup && now >= record.pendingFollowup.expiresAt) {
+      if (record.pendingFollowup.inFlight > 0) record.pendingFollowup.expired = true;
+      else record.pendingFollowup = null;
+    }
     const expiresAt = record.active ? Math.min(record.idleExpiresAt, record.absoluteExpiresAt) : record.expiresAt;
     if (now >= expiresAt) delegationRecords.delete(task);
   }
@@ -165,11 +246,25 @@ function pruneDelegations(now = Date.now()) {
 }
 
 function validTaskBase(value) {
-  return typeof value === "string" && /^[a-z][a-z0-9_]{0,31}$/.test(value);
+  return typeof value === "string" && value.length <= 32 &&
+    /^[a-z][a-z0-9]{1,15}(?:_[a-z0-9]{1,15}){1,3}$/.test(value) &&
+    !["deepseek_job", "subagent_job", "worker_task"].includes(value) &&
+    !/^worker_[a-z0-9]+$/.test(value);
 }
 
 function validDelegationMessage(value) {
   return typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= maxDelegationMessageBytes;
+}
+
+function delegationMessageBytes(record) {
+  return record.messages.reduce((total, message) => total + Buffer.byteLength(message, "utf8"), 0) +
+    (record.pendingFollowup ? Buffer.byteLength(record.pendingFollowup.message, "utf8") : 0);
+}
+
+function totalDelegationMessageBytes() {
+  let total = 0;
+  for (const record of delegationRecords.values()) total += delegationMessageBytes(record);
+  return total;
 }
 
 function prepareDelegation(payload) {
@@ -184,16 +279,24 @@ function prepareDelegation(payload) {
   if (delegationRecords.size >= maxDelegationRecords) {
     throw Object.assign(new Error("Delegation preparation capacity is exhausted."), { statusCode: 503 });
   }
+  const messageBytes = Buffer.byteLength(payload.message, "utf8");
+  if (messageBytes > maxDelegationMessageBytesPerTask ||
+      totalDelegationMessageBytes() + messageBytes > maxDelegationMessageBytesGlobal) {
+    throw Object.assign(new Error("Delegation message memory capacity is exhausted."), { statusCode: 503 });
+  }
   const now = Date.now();
   const expiresAt = now + delegationTtlMs;
   let taskName;
   do { taskName = `${payload.taskName}_${randomBytes(12).toString("hex")}`; }
   while (delegationRecords.has(taskName));
   const record = {
-    message: payload.message, createdAt: now, expiresAt, active: false,
+    messages: [payload.message], envelopeDigests: [], pendingFollowup: null,
+    createdAt: now, expiresAt, active: false,
     idleExpiresAt: 0, absoluteExpiresAt: now + activeDelegationAbsoluteTtlMs,
-    reasoningDigests: new Map(), reasoningCipherDigests: new Map(),
-    credentialId: "", credentialBindingTail: Promise.resolve(),
+    reasoningDigests: new Map(), reasoningCipherDigests: new Map(), responseIdDigests: new Set(),
+    lastCommittedFollowupRequestDigest: "",
+    credentialId: "", providerMode: "", fallbackModel: lastParentModel || initialRuntime.parentModel || "", fallbackReason: "",
+    credentialBindingTail: Promise.resolve(),
   };
   delegationRecords.set(taskName, record);
   const expiryTimer = setTimeout(() => {
@@ -204,6 +307,49 @@ function prepareDelegation(payload) {
   return { taskName, expiresInSeconds: Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000)) };
 }
 
+function prepareFollowup(payload) {
+  pruneDelegations();
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) ||
+      Object.keys(payload).some((key) => !["taskName", "message"].includes(key)) ||
+      !validDelegationMessage(payload.message)) {
+    throw Object.assign(new Error("Invalid delegation follow-up request."), { statusCode: 400 });
+  }
+  const taskMatch = typeof payload.taskName === "string"
+    ? payload.taskName.match(/^(?:\/root\/)?([a-z0-9_]+)$/)
+    : null;
+  const taskName = taskMatch?.[1] || "";
+  const record = taskName ? delegationRecords.get(taskName) : null;
+  if (!record || !record.active || record.envelopeDigests.length !== record.messages.length) {
+    throw routerError("TASK_BINDING_REQUIRED", "DeepSeek follow-up requires one completed prepared task.", 409);
+  }
+  if (record.pendingFollowup) {
+    throw routerError("FOLLOWUP_ALREADY_PENDING", "A DeepSeek follow-up is already pending for this task.", 409);
+  }
+  const followupBytes = Buffer.byteLength(payload.message, "utf8");
+  if (record.messages.length >= maxDelegationMessagesPerTask ||
+      delegationMessageBytes(record) + followupBytes > maxDelegationMessageBytesPerTask ||
+      totalDelegationMessageBytes() + followupBytes > maxDelegationMessageBytesGlobal) {
+    throw Object.assign(new Error("Delegation follow-up memory capacity is exhausted."), { statusCode: 503 });
+  }
+  const now = Date.now();
+  const expiresAt = Math.min(now + delegationTtlMs, record.idleExpiresAt, record.absoluteExpiresAt);
+  if (expiresAt <= now) {
+    delegationRecords.delete(taskName);
+    throw routerError("TASK_BINDING_REQUIRED", "DeepSeek follow-up task binding expired.", 409);
+  }
+  const pending = { message: payload.message, createdAt: now, expiresAt, inFlight: 0, expired: false, requestDigest: "" };
+  record.pendingFollowup = pending;
+  const expiryTimer = setTimeout(() => {
+    if (delegationRecords.get(taskName) === record && record.pendingFollowup === pending && Date.now() >= expiresAt) {
+      if (pending.inFlight > 0) pending.expired = true;
+      else record.pendingFollowup = null;
+    }
+  }, Math.max(1, expiresAt - now + 1));
+  expiryTimer.unref();
+  counters.followupsPrepared++;
+  return { taskName, expiresInSeconds: Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000)) };
+}
+
 const collaborationEnvelopePattern = /^Message Type: NEW_TASK\nTask name: ([^\n]+)\nSender: [^\n]+\nPayload:\n$/;
 function reasoningDigest(id, encryptedContent) {
   return createHmac("sha256", provenanceKey).update(id).update("\0").update(encryptedContent).digest("base64url");
@@ -211,6 +357,23 @@ function reasoningDigest(id, encryptedContent) {
 
 function reasoningCipherDigest(encryptedContent) {
   return createHmac("sha256", provenanceKey).update("cipher\0").update(encryptedContent).digest("base64url");
+}
+
+function validResponseId(value) {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 512 &&
+    !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function responseIdDigest(responseId) {
+  return createHmac("sha256", provenanceKey).update("response\0").update(responseId).digest("base64url");
+}
+
+function envelopeDigest(encryptedContent) {
+  return createHmac("sha256", provenanceKey).update("envelope\0").update(encryptedContent).digest("base64url");
+}
+
+function providerRequestDigest(body) {
+  return createHmac("sha256", provenanceKey).update("provider-request\0").update(body).digest("base64url");
 }
 
 function touchDelegation(record, now = Date.now()) {
@@ -224,13 +387,15 @@ function totalReasoningDigests() {
   return total;
 }
 
-function inspectDelegationMessages(payload) {
-  pruneDelegations();
-  if (!Array.isArray(payload?.input)) {
-    counters.delegationMisses++;
-    throw routerError("TASK_ENVELOPE_REQUIRED", "DeepSeek request input must preserve its prepared task envelope.", 409);
-  }
-  const encryptedMessages = payload.input.flatMap((value) => {
+function totalResponseIdDigests() {
+  let total = 0;
+  for (const record of delegationRecords.values()) total += record.responseIdDigests.size;
+  return total;
+}
+
+function delegationEnvelopeCandidates(payload) {
+  if (!Array.isArray(payload?.input)) return [];
+  return payload.input.flatMap((value) => {
     if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value.content)) return [];
     const envelopes = value.content.filter((item) => item?.type === "input_text" && collaborationEnvelopePattern.test(item.text || ""));
     const encrypted = value.content.filter((item) => item?.type === "encrypted_content" && Object.hasOwn(item, "encrypted_content"));
@@ -238,9 +403,58 @@ function inspectDelegationMessages(payload) {
     const match = envelopes[0].text.match(collaborationEnvelopePattern);
     return [{ value, encrypted: encrypted[0], taskName: taskLeaf(match?.[1]) }];
   });
-  if (encryptedMessages.length !== 1 || !encryptedMessages[0].taskName) {
+}
+
+function preparedDelegationForPayload(payload) {
+  pruneDelegations();
+  const encryptedMessages = delegationEnvelopeCandidates(payload);
+  if (encryptedMessages.length >= 1 && encryptedMessages[0].taskName) {
+    const taskName = encryptedMessages[0].taskName;
+    if (encryptedMessages.some((item) => item.taskName !== taskName)) return null;
+    const prepared = delegationRecords.get(taskName);
+    if (!prepared) return null;
+    const plaintextMessages = prepared.pendingFollowup
+      ? [...prepared.messages, prepared.pendingFollowup.message]
+      : prepared.messages;
+    if (encryptedMessages.length !== plaintextMessages.length) return null;
+    return {
+      taskName, prepared, encryptedMessages, plaintextMessages,
+      pendingFollowup: prepared.pendingFollowup, binding: "envelope",
+    };
+  }
+  if (encryptedMessages.length !== 0 || !validResponseId(payload?.previous_response_id)) return null;
+  const digest = responseIdDigest(payload.previous_response_id);
+  const matches = [...delegationRecords.entries()].filter(([, record]) => record.active && record.responseIdDigests.has(digest));
+  if (matches.length !== 1) return null;
+  const [taskName, prepared] = matches[0];
+  return { taskName, prepared, encryptedMessages: [], plaintextMessages: [], pendingFollowup: null, binding: "previous_response_id" };
+}
+
+function inspectDelegationMessages(payload) {
+  pruneDelegations();
+  if (!Array.isArray(payload?.input)) {
+    counters.delegationMisses++;
+    throw routerError("TASK_ENVELOPE_REQUIRED", "DeepSeek request input must preserve its prepared task envelope.", 409);
+  }
+  const binding = preparedDelegationForPayload(payload);
+  if (!binding) {
     counters.delegationMisses++;
     throw routerError("TASK_BINDING_REQUIRED", "DeepSeek request must bind exactly one prepared task.", 409);
+  }
+  const { taskName, prepared, encryptedMessages, plaintextMessages, pendingFollowup } = binding;
+  if (encryptedMessages.some(({ encrypted }) =>
+    typeof encrypted.encrypted_content !== "string" || encrypted.encrypted_content.length < 1)) {
+    counters.delegationMisses++;
+    throw routerError("TASK_ENVELOPE_INVALID", "DeepSeek task envelope ciphertext is invalid.", 409);
+  }
+  const observedEnvelopeDigests = encryptedMessages.map(({ encrypted }) => envelopeDigest(encrypted.encrypted_content));
+  if (observedEnvelopeDigests.length > 0 &&
+      prepared.envelopeDigests.some((digest, index) => observedEnvelopeDigests[index] !== digest)) {
+    counters.delegationMisses++;
+    throw routerError("TASK_ENVELOPE_HISTORY_MISMATCH", "DeepSeek follow-up envelope history does not match this task.", 409);
+  }
+  if (prepared.providerMode === "parent") {
+    return { taskName, prepared, encryptedMessages, plaintextMessages, pendingFollowup, observedEnvelopeDigests };
   }
   const encryptedNodes = new Set();
   const visit = (value) => {
@@ -250,12 +464,6 @@ function inspectDelegationMessages(payload) {
     for (const child of Object.values(value)) visit(child);
   };
   visit(payload);
-  const taskName = encryptedMessages[0].taskName;
-  const prepared = delegationRecords.get(taskName);
-  if (!prepared) {
-    counters.delegationMisses++;
-    throw routerError("TASK_PREPARATION_UNAVAILABLE", "DeepSeek delegation plaintext is unavailable.", 409);
-  }
   const recognizedEncryptedNodes = new Set(encryptedMessages.map((item) => item.encrypted));
   for (const item of payload.input) {
     if (!item || typeof item !== "object" || Array.isArray(item) || !Object.hasOwn(item, "encrypted_content")) continue;
@@ -286,22 +494,45 @@ function inspectDelegationMessages(payload) {
     counters.delegationMisses++;
     throw routerError("ENCRYPTED_PAYLOAD_UNSUPPORTED", "DeepSeek encrypted payload is unsupported or in an invalid position.", 409);
   }
-  return { taskName, prepared, encryptedMessages };
+  return { taskName, prepared, encryptedMessages, plaintextMessages, pendingFollowup, observedEnvelopeDigests };
 }
 
-function injectDelegationMessages(payload) {
+function injectDelegationMessages(payload, requestDigest) {
   const inspected = inspectDelegationMessages(payload);
-  for (const { value, encrypted } of inspected.encryptedMessages) {
+  if (inspected.pendingFollowup) {
+    const pending = inspected.pendingFollowup;
+    if (pending.requestDigest && pending.requestDigest !== requestDigest) {
+      throw routerError("FOLLOWUP_REQUEST_MISMATCH", "The prepared DeepSeek follow-up is already bound to another provider request.", 409);
+    }
+    if (pending.inFlight > 0) {
+      throw routerError("FOLLOWUP_REQUEST_IN_PROGRESS", "The same DeepSeek follow-up provider request is already running.", 409);
+    }
+    pending.requestDigest = requestDigest;
+    pending.inFlight = 1;
+  } else if (inspected.prepared.lastCommittedFollowupRequestDigest === requestDigest) {
+    throw routerError("FOLLOWUP_REQUEST_REPLAYED", "The same DeepSeek follow-up provider request was already committed.", 409);
+  }
+  inspected.encryptedMessages.forEach(({ value, encrypted }, index) => {
     value.content = value.content.flatMap((content) => content === encrypted
-      ? [{ type: "input_text", text: inspected.prepared.message }]
+      ? [{ type: "input_text", text: inspected.plaintextMessages[index] }]
       : [content]);
     value.type = "message";
     value.role = "user";
     for (const field of ["author", "recipient", "status", "phase", "metadata", "internal_chat_message_metadata_passthrough"]) delete value[field];
-  }
+  });
   touchDelegation(inspected.prepared);
   counters.delegationsInjected++;
+  inspected.requestDigest = requestDigest;
   return inspected;
+}
+
+function releasePendingFollowup(delegation) {
+  const pending = delegation?.pendingFollowup;
+  if (!pending) return;
+  pending.inFlight = Math.max(0, pending.inFlight - 1);
+  if (pending.inFlight === 0 && pending.expired && delegation.prepared.pendingFollowup === pending) {
+    delegation.prepared.pendingFollowup = null;
+  }
 }
 
 async function acquireCredentialBinding(record) {
@@ -310,6 +541,31 @@ async function acquireCredentialBinding(record) {
   record.credentialBindingTail = new Promise((resolveRelease) => { release = resolveRelease; });
   await predecessor;
   return release;
+}
+
+function activateParentFallback(payload, delegation, runtime, reason) {
+  const model = delegation.prepared.fallbackModel || lastParentModel || runtime.parentModel || "";
+  if (!validParentModel(model)) {
+    throw routerError("PARENT_FALLBACK_MODEL_UNAVAILABLE", "The parent GPT model is unavailable for safe fallback.", 503);
+  }
+  const transitioning = delegation.prepared.providerMode !== "parent";
+  if (transitioning) {
+    payload.input = payload.input.filter((item) => !(item?.type === "reasoning" && Object.hasOwn(item, "encrypted_content")));
+    delete payload.previous_response_id;
+    delegation.prepared.reasoningDigests.clear();
+    delegation.prepared.reasoningCipherDigests.clear();
+    delegation.prepared.responseIdDigests.clear();
+    delegation.prepared.credentialId = "";
+    delegation.prepared.providerMode = "parent";
+    delegation.prepared.fallbackModel = model;
+    delegation.prepared.fallbackReason = reason;
+    if (reason === "payload_too_large") counters.payloadTooLargeFallbacks++;
+    else counters.unavailableCredentialFallbacks++;
+  }
+  payload.model = delegation.prepared.fallbackModel;
+  touchDelegation(delegation.prepared);
+  counters.parentFallbackRequests++;
+  return Buffer.from(JSON.stringify(payload));
 }
 
 function upstreamUrl(baseUrl, suffix, query) {
@@ -417,6 +673,8 @@ class JsonProvenanceObserver {
     this.literalIndex = 0;
     this.statusSeen = 0;
     this.status = null;
+    this.responseIdSeen = 0;
+    this.responseId = null;
     this.outputSeen = false;
     this.capture = "";
     this.captureBytes = 0;
@@ -464,6 +722,10 @@ class JsonProvenanceObserver {
       if (parent.root && key === "status") {
         valueRole = "status";
         if (kind !== "string") this.status = null;
+      }
+      if (parent.root && key === "id") {
+        valueRole = "responseId";
+        if (kind !== "string") this.responseId = null;
       }
       if (parent.root && key === "output" && kind === "array") rootOutputArray = true;
     } else {
@@ -514,12 +776,18 @@ class JsonProvenanceObserver {
         this.statusSeen++;
         if (this.statusSeen > 1) this.#fail("DeepSeek JSON response contains duplicate status fields.");
       }
+      if (context.root && decoded === "id") {
+        this.responseIdSeen++;
+        if (this.responseIdSeen > 1) this.#fail("DeepSeek JSON response contains duplicate id fields.");
+      }
       if (context.root && decoded === "output") {
         if (this.outputSeen) this.#fail("DeepSeek JSON response contains duplicate output fields.");
         this.outputSeen = true;
       }
     } else if (this.stringRole === "status") {
       this.status = decoded;
+    } else if (this.stringRole === "responseId") {
+      this.responseId = decoded;
     }
     this.mode = "default";
     this.stringRole = "";
@@ -667,7 +935,7 @@ class JsonProvenanceObserver {
           this.#startString("key", context.root === true);
         } else {
           const role = this.#beginValue("string");
-          this.#startString(role, role === "status");
+          this.#startString(role, role === "status" || role === "responseId");
         }
         continue;
       }
@@ -709,7 +977,10 @@ class JsonProvenanceObserver {
     if (this.statusSeen !== 1 || this.status !== "completed") {
       throw Object.assign(new Error("DeepSeek JSON response did not complete successfully."), { statusCode: 502 });
     }
-    return this.candidates;
+    if (this.responseIdSeen > 0 && !validResponseId(this.responseId)) {
+      this.#fail("DeepSeek JSON response contains an invalid id field.");
+    }
+    return { candidates: this.candidates, responseId: this.responseId };
   }
 }
 
@@ -721,6 +992,7 @@ class SseProvenanceObserver {
     this.candidates = new Map();
     this.completed = false;
     this.terminalBlock = null;
+    this.responseId = null;
   }
 
   feed(chunk) {
@@ -779,6 +1051,16 @@ class SseProvenanceObserver {
     if (this.completed) {
       throw Object.assign(new Error("DeepSeek returned data after its SSE completion event."), { statusCode: 502 });
     }
+    const responseId = payload?.response?.id;
+    if (responseId !== undefined) {
+      if (!validResponseId(responseId)) {
+        throw Object.assign(new Error("DeepSeek SSE response contains an invalid response id."), { statusCode: 502 });
+      }
+      if (this.responseId && this.responseId !== responseId) {
+        throw Object.assign(new Error("DeepSeek SSE response id changed during one response."), { statusCode: 502 });
+      }
+      this.responseId = responseId;
+    }
     if (type === "response.output_item.done") addReasoningCandidate(this.candidates, payload?.item);
     if (type === "response.completed") {
       this.completed = true;
@@ -793,7 +1075,7 @@ class SseProvenanceObserver {
     if (!this.completed || !this.terminalBlock) {
       throw Object.assign(new Error("DeepSeek SSE response ended without a completion event."), { statusCode: 502 });
     }
-    return { candidates: this.candidates, terminalBlock: this.terminalBlock, forward };
+    return { candidates: this.candidates, responseId: this.responseId, terminalBlock: this.terminalBlock, forward };
   }
 }
 
@@ -803,7 +1085,7 @@ function provenanceObserver(contentType) {
     : new JsonProvenanceObserver();
 }
 
-function commitReasoningProvenance(taskName, record, candidates) {
+function commitResponseProvenance(taskName, record, candidates, responseId, delegation) {
   pruneDelegations();
   if (delegationRecords.get(taskName) !== record || !record.active) {
     throw Object.assign(new Error("DeepSeek task expired before reasoning provenance could be committed."), { statusCode: 409 });
@@ -831,10 +1113,37 @@ function commitReasoningProvenance(taskName, record, candidates) {
     record.reasoningDigests.set(id, digest);
     record.reasoningCipherDigests.set(cipherDigest, id);
   }
+  if (responseId) {
+    const digest = responseIdDigest(responseId);
+    for (const [otherTaskName, otherRecord] of delegationRecords) {
+      if (otherTaskName !== taskName && otherRecord.responseIdDigests.has(digest)) {
+        throw Object.assign(new Error("DeepSeek reused one response id across multiple tasks."), { statusCode: 502 });
+      }
+    }
+    if (!record.responseIdDigests.has(digest) &&
+        (record.responseIdDigests.size >= maxResponseIdDigestsPerTask || totalResponseIdDigests() >= maxResponseIdDigestsGlobal)) {
+      delegationRecords.delete(taskName);
+      throw Object.assign(new Error("DeepSeek response provenance capacity is exhausted."), { statusCode: 503 });
+    }
+    record.responseIdDigests.add(digest);
+  }
+  if (delegation?.observedEnvelopeDigests?.length) {
+    if (record.pendingFollowup !== delegation.pendingFollowup ||
+        delegation.observedEnvelopeDigests.length !== record.messages.length + (delegation.pendingFollowup ? 1 : 0) ||
+        record.envelopeDigests.some((digest, index) => delegation.observedEnvelopeDigests[index] !== digest)) {
+      throw Object.assign(new Error("DeepSeek follow-up state changed before it could be committed."), { statusCode: 409 });
+    }
+    if (delegation.pendingFollowup) {
+      record.messages.push(delegation.pendingFollowup.message);
+      record.lastCommittedFollowupRequestDigest = delegation.requestDigest;
+      record.pendingFollowup = null;
+    }
+    record.envelopeDigests = [...delegation.observedEnvelopeDigests];
+  }
   touchDelegation(record);
 }
 
-async function proxy(request, response, body) {
+async function proxy(request, response, body, reservation) {
   const runtime = await loadRuntime();
   if (runtime.routeToken !== initialRuntime.routeToken || runtime.port !== initialRuntime.port) {
     throw Object.assign(new Error("DeepSeek router endpoint changed."), { statusCode: 503 });
@@ -844,14 +1153,18 @@ async function proxy(request, response, body) {
   const modelsRequest = request.method === "GET" && suffix === "/models";
   let routeToDeepSeek = false;
   let payload = null;
+  let requestDigest = "";
   if (!modelsRequest) {
-    const jsonBody = await decodeJsonBody(body, request.headers["content-encoding"]);
+    const jsonBody = await decodeJsonBody(body, request.headers["content-encoding"], reservation);
+    requestDigest = providerRequestDigest(jsonBody);
     try { payload = JSON.parse(jsonBody.toString("utf8")); }
     catch { throw Object.assign(new Error("Provider request is not valid JSON."), { statusCode: 400 }); }
-    routeToDeepSeek = typeof payload?.model === "string" && payload.model !== "" && payload.model === runtime.selectedModel;
-    if (typeof payload?.model === "string" && payload.model.startsWith("deepseek-") && !routeToDeepSeek) {
+    const selectedModelRequested = typeof payload?.model === "string" && payload.model !== "" && payload.model === runtime.selectedModel;
+    if (typeof payload?.model === "string" && payload.model.startsWith("deepseek-") && !selectedModelRequested) {
       throw Object.assign(new Error("DeepSeek request model does not match the active configured model."), { statusCode: 409 });
     }
+    if (validParentModel(payload?.model)) lastParentModel = payload.model;
+    routeToDeepSeek = selectedModelRequested || Boolean(preparedDelegationForPayload(payload));
   }
   let headers;
   let baseUrl;
@@ -861,38 +1174,73 @@ async function proxy(request, response, body) {
   let deepseekCandidates = [];
   let deepseekCredentialValues = [];
   let releaseCredentialBinding = null;
-  if (routeToDeepSeek) {
-    delegation = injectDelegationMessages(payload);
-    if (!delegation.prepared.credentialId) releaseCredentialBinding = await acquireCredentialBinding(delegation.prepared);
-    try {
-      if (delegationRecords.get(delegation.taskName) !== delegation.prepared || !delegation.prepared.active) {
-        throw Object.assign(new Error("DeepSeek task expired before credential binding."), { statusCode: 409 });
-      }
-      const settings = JSON.parse(await readFile(runtime.settingsFile, "utf8"));
-      if (settings?.model !== runtime.selectedModel) throw Object.assign(new Error("DeepSeek model configuration changed."), { statusCode: 503 });
-      let credentials;
-      try { credentials = credentialsFromSettingsDocument(settings, { defaultBaseUrl: defaultDeepSeekBaseUrl }); }
-      catch { throw Object.assign(new Error("DeepSeek credential pool is invalid."), { statusCode: 503 }); }
-      deepseekCredentialValues = credentials.map((credential) => credential.apiKey);
-      credentialPool.sync(settings?.revision);
-      deepseekCandidates = credentialPool.candidates(credentials, { pinnedId: delegation.prepared.credentialId || "" });
-      if (!deepseekCandidates.length) throw Object.assign(new Error("No enabled DeepSeek credential is currently available."), { statusCode: 503 });
-      bodyRewritten = true;
-      upstreamBody = Buffer.from(JSON.stringify(payload));
-      baseUrl = deepseekCandidates[0].baseUrl;
-      counters.deepseekRequests++;
-    } catch (error) {
-      releaseCredentialBinding?.();
-      releaseCredentialBinding = null;
-      throw error;
-    }
-  } else {
+  let usingDeepSeek = routeToDeepSeek;
+  const configureParentFallback = (reason) => {
     if (typeof request.headers.authorization !== "string" || request.headers.authorization.length < 16) {
       throw Object.assign(new Error("Parent provider authorization is unavailable."), { statusCode: 401 });
     }
-    headers = parentHeaders(request.headers, modelsRequest);
+    upstreamBody = activateParentFallback(payload, delegation, runtime, reason);
+    reserveProviderBytes(upstreamBody.length, reservation);
+    bodyRewritten = true;
+    headers = parentHeaders(request.headers, false, true);
     baseUrl = runtime.parentBaseUrl;
+    usingDeepSeek = false;
     counters.parentRequests++;
+    releaseCredentialBinding?.();
+    releaseCredentialBinding = null;
+  };
+  try {
+    if (routeToDeepSeek) {
+      delegation = injectDelegationMessages(payload, requestDigest);
+      if (delegation.prepared.providerMode === "parent") {
+        configureParentFallback(delegation.prepared.fallbackReason || "unavailable_credentials");
+      } else {
+        payload.model = runtime.selectedModel;
+        if (!delegation.prepared.credentialId) releaseCredentialBinding = await acquireCredentialBinding(delegation.prepared);
+        if (delegationRecords.get(delegation.taskName) !== delegation.prepared || !delegation.prepared.active) {
+          throw Object.assign(new Error("DeepSeek task expired before credential binding."), { statusCode: 409 });
+        }
+        if (delegation.prepared.providerMode === "parent") {
+          configureParentFallback(delegation.prepared.fallbackReason || "unavailable_credentials");
+        } else {
+          let settings;
+          let credentials;
+          try {
+            settings = JSON.parse(await readFile(runtime.settingsFile, "utf8"));
+            if (settings?.model !== runtime.selectedModel) throw new Error("DeepSeek model configuration changed.");
+            credentials = credentialsFromSettingsDocument(settings, { defaultBaseUrl: defaultDeepSeekBaseUrl });
+          } catch {
+            configureParentFallback("unavailable_credentials");
+          }
+          if (usingDeepSeek) {
+            deepseekCredentialValues = credentials.map((credential) => credential.apiKey);
+            credentialPool.sync(settings?.revision);
+            deepseekCandidates = credentialPool.candidates(credentials, { pinnedId: delegation.prepared.credentialId || "" });
+            if (!deepseekCandidates.length) configureParentFallback("unavailable_credentials");
+          }
+          if (usingDeepSeek) {
+            bodyRewritten = true;
+            upstreamBody = Buffer.from(JSON.stringify(payload));
+            reserveProviderBytes(upstreamBody.length, reservation);
+            baseUrl = deepseekCandidates[0].baseUrl;
+            counters.deepseekRequests++;
+          }
+        }
+      }
+    } else {
+      if (typeof request.headers.authorization !== "string" || request.headers.authorization.length < 16) {
+        throw Object.assign(new Error("Parent provider authorization is unavailable."), { statusCode: 401 });
+      }
+      headers = parentHeaders(request.headers, modelsRequest);
+      baseUrl = runtime.parentBaseUrl;
+      counters.parentRequests++;
+    }
+  } catch (error) {
+    releasePendingFollowup(delegation);
+    releaseCredentialBinding?.();
+    delegation = null;
+    releaseCredentialBinding = null;
+    throw error;
   }
 
   const controller = new AbortController();
@@ -904,51 +1252,77 @@ async function proxy(request, response, body) {
   try {
     let upstream;
     let selectedCredential = null;
-    const attempts = routeToDeepSeek ? deepseekCandidates : [null];
+    const attempts = usingDeepSeek ? deepseekCandidates : [null];
     for (let index = 0; index < attempts.length; index++) {
       selectedCredential = attempts[index];
-      if (routeToDeepSeek) {
+      if (usingDeepSeek) {
         headers = deepseekHeaders(selectedCredential.apiKey, request.headers, bodyRewritten);
         baseUrl = selectedCredential.baseUrl;
         counters.deepseekAttempts++;
       }
-      upstream = await fetch(upstreamUrl(baseUrl, suffix, routeToDeepSeek ? "" : requestUrl.search), {
+      upstream = await fetch(upstreamUrl(baseUrl, suffix, usingDeepSeek ? "" : requestUrl.search), {
         method: request.method,
         headers,
         body: request.method === "GET" || request.method === "HEAD" ? undefined : upstreamBody,
         redirect: "error",
         signal: controller.signal,
       });
-      if (routeToDeepSeek) counters.deepseekUpstreamResponses++;
+      if (usingDeepSeek) counters.deepseekUpstreamResponses++;
       else counters.parentUpstreamResponses++;
-      const reason = routeToDeepSeek ? failoverReason(upstream.status) : "";
+      if (usingDeepSeek && upstream.status === 413) {
+        try { await upstream.body?.cancel(); } catch {}
+        configureParentFallback("payload_too_large");
+        upstream = await fetch(upstreamUrl(baseUrl, suffix, requestUrl.search), {
+          method: request.method,
+          headers,
+          body: request.method === "GET" || request.method === "HEAD" ? undefined : upstreamBody,
+          redirect: "error",
+          signal: controller.signal,
+        });
+        counters.parentUpstreamResponses++;
+        break;
+      }
+      const reason = usingDeepSeek ? failoverReason(upstream.status) : "";
       if (!reason) break;
       credentialPool.markFailure(selectedCredential.id, reason);
       const pinned = Boolean(delegation.prepared.credentialId);
-      if (pinned || index === attempts.length - 1) break;
+      if (pinned || index === attempts.length - 1) {
+        try { await upstream.body?.cancel(); } catch {}
+        configureParentFallback("unavailable_credentials");
+        upstream = await fetch(upstreamUrl(baseUrl, suffix, requestUrl.search), {
+          method: request.method,
+          headers,
+          body: request.method === "GET" || request.method === "HEAD" ? undefined : upstreamBody,
+          redirect: "error",
+          signal: controller.signal,
+        });
+        counters.parentUpstreamResponses++;
+        break;
+      }
       try { await upstream.body?.cancel(); } catch {}
       counters.deepseekFailovers++;
     }
-    if (routeToDeepSeek && upstream.ok) {
+    if (usingDeepSeek && upstream.ok) {
       credentialPool.markSuccess(selectedCredential.id);
       if (!delegation.prepared.credentialId) delegation.prepared.credentialId = selectedCredential.id;
       else if (delegation.prepared.credentialId !== selectedCredential.id) {
         throw Object.assign(new Error("DeepSeek task credential binding changed unexpectedly."), { statusCode: 409 });
       }
+      delegation.prepared.providerMode = "deepseek";
     }
     clearTimeout(headerTimer);
     const resetIdleTimer = () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => controller.abort(), upstreamIdleTimeoutMs);
     };
-    if (routeToDeepSeek && !upstream.ok) {
+    if (usingDeepSeek && !upstream.ok) {
       try { await upstream.body?.cancel(); } catch {}
       response.writeHead(upstream.status, { "content-type": "application/json", "cache-control": "no-store" });
       response.end(JSON.stringify({ error: { code: "DEEPSEEK_UPSTREAM_ERROR", message: `DeepSeek upstream returned HTTP ${upstream.status}.` } }));
       return;
     }
     const responseHeaders = {};
-    if (routeToDeepSeek) {
+    if (usingDeepSeek) {
       if (upstream.headers.get("content-encoding")) {
         throw Object.assign(new Error("DeepSeek returned an unsupported encoded response."), { statusCode: 502 });
       }
@@ -983,8 +1357,8 @@ async function proxy(request, response, body) {
       try { await upstream.body?.cancel(); } catch {}
       throw Object.assign(new Error("Parent model catalog returned an unusable not-modified response."), { statusCode: 502 });
     }
-    const observer = routeToDeepSeek && upstream.ok ? provenanceObserver(upstream.headers.get("content-type")) : null;
-    const credentialNeedles = routeToDeepSeek ? deepseekCredentialValues.map((value) => Buffer.from(value, "utf8")) : [];
+    const observer = delegation && upstream.ok ? provenanceObserver(upstream.headers.get("content-type")) : null;
+    const credentialNeedles = usingDeepSeek ? deepseekCredentialValues.map((value) => Buffer.from(value, "utf8")) : [];
     const credentialTails = credentialNeedles.map(() => Buffer.alloc(0));
     const assertCredentialNotReflected = (chunk) => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -1016,12 +1390,12 @@ async function proxy(request, response, body) {
     }
     if (observer) {
       const observed = observer.finish();
-      const candidates = observer.streaming ? observed.candidates : observed;
+      const candidates = observed.candidates;
       if (observer.streaming) {
         for (const forwardedChunk of observed.forward) assertCredentialNotReflected(forwardedChunk);
         assertCredentialNotReflected(observed.terminalBlock);
       }
-      commitReasoningProvenance(delegation.taskName, delegation.prepared, candidates);
+      commitResponseProvenance(delegation.taskName, delegation.prepared, candidates, observed.responseId, delegation);
       if (observer.streaming) {
         for (const forwardedChunk of observed.forward) {
           if (!response.write(forwardedChunk) && !await waitForDrainOrClose(response)) return;
@@ -1031,6 +1405,7 @@ async function proxy(request, response, body) {
     }
     response.end();
   } finally {
+    releasePendingFollowup(delegation);
     releaseCredentialBinding?.();
     clearTimeout(headerTimer);
     clearTimeout(overallTimer);
@@ -1076,7 +1451,13 @@ const server = createServer(async (request, response) => {
   try {
     if (request.method === "GET" && request.url === `/${initialRuntime.routeToken}/healthz`) {
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-      response.end(JSON.stringify({ status: "ok", instanceId: initialRuntime.instanceId, routerPid: process.pid, ...counters, credentials: await credentialHealth() }));
+      response.end(JSON.stringify({
+        status: "ok", instanceId: initialRuntime.instanceId, routerPid: process.pid, ...counters,
+        providerRequestMaxBytes: maxProviderRequestBytes,
+        providerBufferedMaxBytes: maxProviderBufferedBytes,
+        providerBufferedBytes: bufferedProviderBytes,
+        credentials: await credentialHealth(),
+      }));
       return;
     }
     if (request.method === "POST" && request.url === `/${initialRuntime.routeToken}/control/credential-failure`) {
@@ -1096,7 +1477,7 @@ const server = createServer(async (request, response) => {
         response.writeHead(204, { "cache-control": "no-store" });
         response.end();
       } finally {
-        bufferedBytes -= Math.min(read.reservedBytes, bufferedBytes);
+        bufferedControlBytes -= Math.min(read.reservedBytes, bufferedControlBytes);
       }
       return;
     }
@@ -1129,7 +1510,7 @@ const server = createServer(async (request, response) => {
       return;
     }
     const requestUrl = new URL(request.url, "http://127.0.0.1");
-    if (requestUrl.pathname === `/${initialRuntime.routeToken}/delegations/prepare`) {
+    if ([`/${initialRuntime.routeToken}/delegations/prepare`, `/${initialRuntime.routeToken}/delegations/followup`].includes(requestUrl.pathname)) {
       if (request.method !== "POST" || requestUrl.search || request.headers["content-encoding"] ||
           String(request.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase() !== "application/json") {
         request.resume();
@@ -1147,11 +1528,11 @@ const server = createServer(async (request, response) => {
         let payload;
         try { payload = JSON.parse(read.body.toString("utf8")); }
         catch { throw Object.assign(new Error("Delegation preparation body is not valid JSON."), { statusCode: 400 }); }
-        const prepared = prepareDelegation(payload);
+        const prepared = requestUrl.pathname.endsWith("/followup") ? prepareFollowup(payload) : prepareDelegation(payload);
         response.writeHead(201, { "content-type": "application/json", "cache-control": "no-store" });
         response.end(JSON.stringify(prepared));
       } finally {
-        bufferedBytes -= Math.min(reservedBytes, bufferedBytes);
+        bufferedControlBytes -= Math.min(reservedBytes, bufferedControlBytes);
         activeRequests--;
       }
       return;
@@ -1165,13 +1546,12 @@ const server = createServer(async (request, response) => {
       throw Object.assign(new Error("Router concurrency limit reached."), { statusCode: 503 });
     }
     activeRequests++;
-    let reservedBytes = 0;
+    const reservation = { bytes: 0 };
     try {
-      const read = await readRequestBody(request);
-      reservedBytes = read.reservedBytes;
-      await proxy(request, response, read.body);
+      const body = await readProviderRequestBody(request, reservation);
+      await proxy(request, response, body, reservation);
     } finally {
-      bufferedBytes -= Math.min(reservedBytes, bufferedBytes);
+      releaseProviderBytes(reservation.bytes, reservation);
       activeRequests--;
     }
   } catch (error) {

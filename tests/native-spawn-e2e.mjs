@@ -29,6 +29,9 @@ const imageFile = join(temp, "synthetic-probe.png");
 const desktopCodex = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const codexBin = process.env.CODEX_BIN || (existsSync(desktopCodex) ? desktopCodex : "codex");
 const codexAuthFile = process.env.CODEX_AUTH_FILE;
+const forceDeepSeek413 = process.env.DEEPSEEK_SUBAGENT_TEST_FORCE_413 === "1";
+const legacyParentProvider = process.env.DEEPSEEK_SUBAGENT_TEST_LEGACY_PARENT === "1";
+assert(!(forceDeepSeek413 && legacyParentProvider), "Native E2E fallback modes are mutually exclusive.");
 assert(codexAuthFile && existsSync(codexAuthFile), "Set CODEX_AUTH_FILE to a logged-in Codex auth.json for the native E2E.");
 const authFixture = JSON.parse(await readFile(codexAuthFile, "utf8"));
 const authSecrets = [authFixture?.OPENAI_API_KEY, ...Object.values(authFixture?.tokens || {})]
@@ -37,6 +40,9 @@ assert(authSecrets.length > 0, "The Codex auth fixture did not contain a usable 
 const parentAuthorizations = new Set(authSecrets.map((secret) => `Bearer ${secret}`));
 const requests = [];
 let preparedTaskName = "";
+let routerRuntime = null;
+let nativeFollowupPrepared = false;
+const nativeFollowupMessage = "Return a second result from the same native child.";
 
 function sse(events) {
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
@@ -67,6 +73,18 @@ function serializedOutput(item) {
   return typeof item?.output === "string" ? item.output : JSON.stringify(item?.output ?? null);
 }
 
+async function stageNativeFollowup() {
+  if (nativeFollowupPrepared) return;
+  assert(routerRuntime, "Native follow-up was requested before the router runtime was available.");
+  const prepared = await fetch(`http://127.0.0.1:${routerRuntime.port}/${routerRuntime.routeToken}/delegations/followup`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskName: `/root/${preparedTaskName}`, message: nativeFollowupMessage }),
+  });
+  assert.equal(prepared.status, 201, `Native follow-up preparation failed: ${await prepared.text()}`);
+  nativeFollowupPrepared = true;
+}
+
 const api = createServer(async (request, response) => {
   let body = "";
   for await (const chunk of request) body += chunk;
@@ -83,11 +101,25 @@ const api = createServer(async (request, response) => {
   });
 
   if (request.url === "/deepseek/v1/responses") {
+    if (forceDeepSeek413) {
+      response.writeHead(413, { "content-type": "application/json" });
+      response.end('{"error":{"message":"synthetic DeepSeek payload limit"}}');
+      return;
+    }
     response.writeHead(200, { "content-type": "text/event-stream" });
+    if (JSON.stringify(payload.input || []).includes(nativeFollowupMessage)) {
+      response.end(sse([
+        { type: "response.created", response: { id: "child-followup-response" } },
+        assistant("child-followup-message", "native DeepSeek child follow-up completed"),
+        completed("child-followup-response"),
+      ]));
+      return;
+    }
     const imageOutput = functionCallOutput(payload, "child_view_image");
     if (!imageOutput) {
       const childTools = visibleTools(payload);
-      assert(childTools.some((tool) => tool.name === "view_image" || tool.tools?.some((nested) => nested.name === "view_image")), "Native DeepSeek child did not receive view_image.");
+      assert(childTools.some((tool) => tool.name === "view_image" || tool.tools?.some((nested) => nested.name === "view_image")),
+        `Native DeepSeek child did not receive view_image. tools=${JSON.stringify(childTools.map((tool) => ({ type: tool.type, name: tool.name, nested: tool.tools?.map((nested) => nested.name) })))} inputTypes=${JSON.stringify((payload.input || []).map((item) => item?.type))}`);
       response.end(sse([
         { type: "response.created", response: { id: "child-tool-response" } },
         {
@@ -121,9 +153,30 @@ const api = createServer(async (request, response) => {
 
   if (request.url === "/parent/v1/responses") {
     response.writeHead(200, { "content-type": "text/event-stream" });
+    const serializedInput = JSON.stringify(payload.input || []);
+    if (forceDeepSeek413 && serializedInput.includes("Message Type: NEW_TASK") &&
+        serializedInput.includes(nativeFollowupMessage)) {
+      response.end(sse([
+        { type: "response.created", response: { id: "fallback-child-followup-response" } },
+        assistant("fallback-child-followup-message", "native GPT fallback child follow-up completed"),
+        completed("fallback-child-followup-response"),
+      ]));
+      return;
+    }
+    if (forceDeepSeek413 && serializedInput.includes("Message Type: NEW_TASK") &&
+        serializedInput.includes("Return a short native child result.")) {
+      response.end(sse([
+        { type: "response.created", response: { id: "fallback-child-response" } },
+        assistant("fallback-child-message", "native GPT fallback child completed"),
+        completed("fallback-child-response"),
+      ]));
+      return;
+    }
     const spawnOutput = functionCallOutput(payload, "native_deepseek");
     const waitOutput = functionCallOutput(payload, "native_wait");
-    if (!spawnOutput && !waitOutput) {
+    const followupOutput = functionCallOutput(payload, "native_followup");
+    const followupWaitOutput = functionCallOutput(payload, "native_followup_wait");
+    if (!spawnOutput) {
       const agentNamespace = visibleTools(payload).find((tool) => tool.type === "namespace" && tool.tools?.some((nested) => nested.name === "spawn_agent"));
       assert(agentNamespace, "Codex did not expose spawn_agent in its direct or Responses Lite tool inventory.");
       const spawnSpec = agentNamespace.tools.find((tool) => tool.name === "spawn_agent");
@@ -142,20 +195,21 @@ const api = createServer(async (request, response) => {
       ]));
       return;
     }
-    if (spawnOutput && !waitOutput) {
-      const spawnMetadata = JSON.parse(serializedOutput(spawnOutput));
-      assert.equal(spawnMetadata.task_name, `/root/${preparedTaskName}`, "spawn_agent did not return the canonical native child task name.");
-      assert.equal(typeof spawnMetadata.nickname, "string", "spawn_agent did not return visible native child metadata.");
-      assert(spawnMetadata.nickname.length > 0, "spawn_agent returned an empty native child nickname.");
-      assert(!serializedOutput(spawnOutput).includes("native DeepSeek child completed"), "spawn_agent unexpectedly blocked until the child completed.");
-      const parentInput = JSON.stringify(payload.input || []);
-      if (parentInput.includes("Message Type: FINAL_ANSWER") && parentInput.includes("native DeepSeek child completed")) {
-        response.end(sse([
-          { type: "response.created", response: { id: "parent-early-completion" } },
-          assistant("parent-message", "parent received native child result before wait_agent"),
-          completed("parent-early-completion"),
-        ]));
-        return;
+    const spawnMetadata = JSON.parse(serializedOutput(spawnOutput));
+    assert.equal(spawnMetadata.task_name, `/root/${preparedTaskName}`, "spawn_agent did not return the canonical native child task name.");
+    assert.equal(typeof spawnMetadata.nickname, "string", "spawn_agent did not return visible native child metadata.");
+    assert(spawnMetadata.nickname.length > 0, "spawn_agent returned an empty native child nickname.");
+    assert(!serializedOutput(spawnOutput).includes("native DeepSeek child completed"), "spawn_agent unexpectedly blocked until the child completed.");
+    const expectedFirstResult = forceDeepSeek413 ? "native GPT fallback child completed" : "native DeepSeek child completed";
+    const expectedFollowupResult = forceDeepSeek413
+      ? "native GPT fallback child follow-up completed"
+      : "native DeepSeek child follow-up completed";
+    const hasFirstResult = serializedInput.includes("Message Type: FINAL_ANSWER") && serializedInput.includes(expectedFirstResult);
+    const hasFollowupResult = serializedInput.includes("Message Type: FINAL_ANSWER") && serializedInput.includes(expectedFollowupResult);
+    if (!hasFirstResult) {
+      if (waitOutput) {
+        assert(/"timed_out"\s*:\s*false/.test(serializedOutput(waitOutput)), "wait_agent timed out before the first child completion reached the mailbox.");
+        throw new Error(`The first child completion was absent after wait_agent: ${serializedInput.slice(-4000)}`);
       }
       const agentNamespace = visibleTools(payload).find((tool) => tool.type === "namespace" && tool.tools?.some((nested) => nested.name === "wait_agent"));
       assert(agentNamespace, "Codex did not expose wait_agent after native spawn_agent completed.");
@@ -172,15 +226,46 @@ const api = createServer(async (request, response) => {
       ]));
       return;
     }
-    assert(spawnOutput, "The parent wait continuation lost the spawn_agent result.");
-    assert(waitOutput, "The parent did not continue after wait_agent completed.");
-    assert(/"timed_out"\s*:\s*false/.test(serializedOutput(waitOutput)), "wait_agent timed out before the child completion reached the mailbox.");
-    const parentInput = JSON.stringify(payload.input || []);
-    assert(parentInput.includes("Message Type: FINAL_ANSWER"), "The child completion was not delivered to the parent mailbox.");
-    assert(parentInput.includes("native DeepSeek child completed"), `The parent did not receive the native child's final content: ${parentInput.slice(-4000)}`);
+    if (!followupOutput) {
+      await stageNativeFollowup();
+      const agentNamespace = visibleTools(payload).find((tool) => tool.type === "namespace" && tool.tools?.some((nested) => nested.name === "followup_task"));
+      assert(agentNamespace, "Codex did not expose followup_task after the native child completed.");
+      response.end(sse([
+        { type: "response.created", response: { id: "parent-followup" } },
+        {
+          type: "response.output_item.done",
+          item: {
+            type: "function_call", call_id: "native_followup", namespace: agentNamespace.name, name: "followup_task",
+            arguments: JSON.stringify({ target: `/root/${preparedTaskName}`, message: nativeFollowupMessage }),
+          },
+        },
+        completed("parent-followup"),
+      ]));
+      return;
+    }
+    if (!hasFollowupResult) {
+      if (followupWaitOutput) {
+        assert(/"timed_out"\s*:\s*false/.test(serializedOutput(followupWaitOutput)), "wait_agent timed out before the follow-up child completion reached the mailbox.");
+        throw new Error(`The follow-up child completion was absent after wait_agent: ${serializedInput.slice(-4000)}`);
+      }
+      const agentNamespace = visibleTools(payload).find((tool) => tool.type === "namespace" && tool.tools?.some((nested) => nested.name === "wait_agent"));
+      assert(agentNamespace, "Codex did not expose wait_agent after native followup_task completed.");
+      response.end(sse([
+        { type: "response.created", response: { id: "parent-followup-wait" } },
+        {
+          type: "response.output_item.done",
+          item: {
+            type: "function_call", call_id: "native_followup_wait", namespace: agentNamespace.name, name: "wait_agent",
+            arguments: JSON.stringify({ timeout_ms: 45_000 }),
+          },
+        },
+        completed("parent-followup-wait"),
+      ]));
+      return;
+    }
     response.end(sse([
       { type: "response.created", response: { id: "parent-finish" } },
-      assistant("parent-message", "parent received native child result"),
+      assistant("parent-message", "parent received native child follow-up result"),
       completed("parent-finish"),
     ]));
     return;
@@ -209,6 +294,7 @@ hide_spawn_agent_metadata = false
 
 [model_providers.custom]
 name = "custom"
+${legacyParentProvider ? "" : `base_url = "http://127.0.0.1:${port}/parent/v1/"`}
 requires_openai_auth = true
 wire_api = "responses"
 `;
@@ -239,6 +325,8 @@ wire_api = "responses"
   const routedConfig = await readFile(join(codexHome, "config.toml"), "utf8");
   assert(routedConfig.includes('model_provider = "deepseek-subagent-router"'));
   const runtime = JSON.parse(await readFile(join(settingsDir, "router-runtime.json"), "utf8"));
+  routerRuntime = runtime;
+  assert.equal(runtime.parentModel, "gpt-5.6-sol");
   const prepared = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/delegations/prepare`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -316,7 +404,7 @@ wire_api = "responses"
     await appRpc("initialize", { clientInfo: { name: "deepseek-subagent-e2e", version: "1.0.0" }, capabilities: { experimentalApi: true } });
     appNotify("initialized");
     const started = await appRpc("thread/start", {
-      cwd: root, model: "gpt-5.6-sol", modelProvider: "deepseek-subagent-router", approvalPolicy: "never", sandbox: "read-only",
+      cwd: root, model: "gpt-5.6-sol", modelProvider: legacyParentProvider ? "custom" : "deepseek-subagent-router", approvalPolicy: "never", sandbox: "read-only",
     });
     const threadId = started.thread.id;
     await appRpc("turn/start", {
@@ -341,24 +429,47 @@ wire_api = "responses"
   const deepseekRequest = deepseekRequests.find((request) => request.model === "deepseek-flash");
   const parentRequest = parentRequests.find((request) => request.model === "gpt-5.6-sol");
   const finalAgentMessage = [...appMessages].reverse().find((message) => message.method === "item/completed" && message.params?.item?.type === "agentMessage");
-  assert(deepseekRequest, `DeepSeek child never reached its configured Responses provider. Parent result: ${finalAgentMessage?.params?.item?.text || "none"}`);
-  assert(parentRequest, "The parent request never reached its configured Responses provider.");
-  assert.equal(deepseekRequests.length, 2, "Native DeepSeek child did not complete exactly one tool continuation.");
+  assert(deepseekRequest,
+    `Native child provider route was unexpected. Requests: ${JSON.stringify(requests.map((entry) => ({ path: entry.path, model: entry.model, authorization: entry.authorization })))}; parent result: ${finalAgentMessage?.params?.item?.text || "none"}`);
+  assert(parentRequest, `The parent request never reached its configured Responses provider: ${JSON.stringify(requests.map((entry) => ({ path: entry.path, model: entry.model, authorization: entry.authorization })))}`);
+  assert.equal(deepseekRequests.length, forceDeepSeek413 ? 1 : 3,
+    forceDeepSeek413
+      ? "Native fallback did not stop after the synthetic DeepSeek 413."
+      : "Native DeepSeek child did not complete exactly one tool continuation and one same-child follow-up.");
   assert(deepseekRequests.every((request) => request.authorization === "deepseek"));
   assert(deepseekRequests.every((request) => request.model === "deepseek-flash"));
   assert(parentRequests.length > 0);
   assert(parentRequests.every((request) => request.authorization === "parent"));
   assert(parentRequests.every((request) => request.model === "gpt-5.6-sol"));
-  const parentEfforts = parentRequests.map((request) => request.body.reasoning?.effort ?? null);
+  const childParentRequests = forceDeepSeek413
+    ? parentRequests.filter((request) => {
+        const input = JSON.stringify(request.body.input || []);
+        return input.includes("Message Type: NEW_TASK") &&
+          (input.includes("Return a short native child result.") || input.includes(nativeFollowupMessage));
+      })
+    : [];
+  assert.equal(childParentRequests.length, forceDeepSeek413 ? 2 : 0, "The native GPT fallback child turns did not reach the parent provider.");
+  const childParentRequestSet = new Set(childParentRequests);
+  const parentEfforts = parentRequests
+    .filter((request) => !childParentRequestSet.has(request))
+    .map((request) => request.body.reasoning?.effort ?? null);
   assert(parentEfforts.every((effort) => effort === "max"), `Codex did not resolve the parent's Ultra selection to its model-owned max wire effort: ${JSON.stringify(parentEfforts)}`);
   assert(deepseekRequests.every((request) => request.body.reasoning?.effort === "high"));
   const capturedBodies = requests.map((request) => JSON.stringify(request.body)).join("\n");
   assert(authSecrets.every((secret) => !capturedBodies.includes(secret)), "A real parent credential leaked into a provider request body.");
-  assert(JSON.stringify(deepseekRequest.body).includes("Return a short native child result."));
-  assert(deepseekRequests.some((request) => functionCallOutput(request.body, "child_view_image")), "Native DeepSeek child never returned the tool result to its provider.");
+  if (deepseekRequest) assert(JSON.stringify(deepseekRequest.body).includes("Return a short native child result."));
+  if (!forceDeepSeek413) {
+    assert(deepseekRequests.some((request) => functionCallOutput(request.body, "child_view_image")), "Native DeepSeek child never returned the tool result to its provider.");
+    assert(deepseekRequests.some((request) => JSON.stringify(request.body.input || []).includes(nativeFollowupMessage)),
+      "Native followup_task did not continue the same DeepSeek child through its provider route.");
+  } else {
+    assert(childParentRequests.some((request) => JSON.stringify(request.body.input || []).includes(nativeFollowupMessage)),
+      "Native followup_task did not continue the GPT fallback child through the parent route.");
+  }
   assert(deepseekRequests.every((request) => !JSON.stringify(request.body).includes("Use the deepseek custom agent to run the native DeepSeek probe")));
   assert(parentRequests.length >= 2, "The parent did not continue after native spawn_agent.");
   assert(parentRequests.some((request) => functionCallOutput(request.body, "native_deepseek")), "The parent did not continue after native spawn_agent returned.");
+  assert(parentRequests.some((request) => functionCallOutput(request.body, "native_followup")), "The parent did not continue after native followup_task returned.");
   const waitRequest = parentRequests.find((request) => functionCallOutput(request.body, "native_wait"));
   const earlyCompletionRequest = parentRequests.find((request) => {
     const input = JSON.stringify(request.body.input || []);
@@ -367,7 +478,12 @@ wire_api = "responses"
   });
   assert(waitRequest || earlyCompletionRequest, "The parent neither waited for nor consumed the already-terminal native child.");
   assert(!appStderr.includes("e2e-fake-deepseek-key"));
-  assert(transcript.includes("native DeepSeek child completed"), "Native child result was not visible in app-server events.");
+  const expectedChildResult = forceDeepSeek413 ? "native GPT fallback child completed" : "native DeepSeek child completed";
+  const expectedFollowupResult = forceDeepSeek413
+    ? "native GPT fallback child follow-up completed"
+    : "native DeepSeek child follow-up completed";
+  assert(transcript.includes(expectedChildResult), "Native child result was not visible in app-server events.");
+  assert(transcript.includes(expectedFollowupResult), "Native same-child follow-up result was not visible in app-server events.");
   const appEventShapes = appMessages
     .filter((message) => typeof message.method === "string" && message.method.startsWith("item/"))
     .map((message) => ({ method: message.method, type: message.params?.item?.type, tool: message.params?.item?.tool, status: message.params?.item?.status }));
@@ -383,10 +499,12 @@ wire_api = "responses"
   } else {
     assert.equal(waitLifecycle.length, 0, `The parent redundantly waited after receiving a terminal child event: ${JSON.stringify(appEventShapes)}`);
   }
-  assert(finalAgentMessage?.params?.item?.text?.includes("parent received native child result"), "The parent did not emit its final post-child response.");
+  assert(finalAgentMessage?.params?.item?.text?.includes("parent received native child follow-up result"), "The parent did not emit its final post-follow-up response.");
   const health = await (await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/healthz`)).json();
   assert.equal(health.delegationsPrepared, 1);
+  assert.equal(health.followupsPrepared, 1);
   assert(health.delegationsInjected >= 1);
+  assert.equal(health.parentFallbackRequests, forceDeepSeek413 ? 2 : 0);
   const cleanupFile = join(settingsDir, "cleanup.mjs");
   assert(existsSync(cleanupFile), "Native integration did not install an independent cleanup command.");
   const validSettings = await readFile(settingsFile, "utf8");
@@ -421,7 +539,8 @@ wire_api = "responses"
   assert.equal(existsSync(settingsFile), false, "Standalone cleanup did not remove the stored credential.");
   assert.equal(existsSync(legacyCredentialHelper), false, "Standalone cleanup did not remove the verified legacy credential helper.");
   assert.equal(existsSync(cleanupFile), false, "Standalone cleanup did not remove its managed copy.");
-  process.stdout.write(`Native app-server spawn_agent E2E passed with ${codexBin} (${waitRequest ? "waited for child" : "consumed early terminal event"})\n`);
+  const scenario = legacyParentProvider ? "legacy-provider bridge " : forceDeepSeek413 ? "GPT fallback " : "";
+  process.stdout.write(`Native app-server spawn_agent + same-child followup_task ${scenario}E2E passed with ${codexBin} (${waitRequest ? "waited for child" : "consumed early terminal event"})\n`);
 } finally {
   await removeNativeIntegration(settingsDir).catch(() => {});
   api.close();

@@ -30,7 +30,7 @@ import {
 } from "./native-config.mjs";
 
 const SERVER_NAME = "deepseek-settings";
-const SERVER_VERSION = "0.7.0+codex.20260917054058";
+const SERVER_VERSION = "0.7.0+codex.20260919103805";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = dirname(SCRIPT_DIR);
 const MODEL_TEMPLATE = join(PLUGIN_DIR, "assets", "model-template.json");
@@ -49,7 +49,9 @@ const MODEL_ID_PATTERN = /^deepseek-[A-Za-z0-9][A-Za-z0-9._:/-]{0,118}$/;
 const RESPONSES_MODELS_NOT_LISTED_BY_API = Object.freeze(["deepseek-flash"]);
 const MODELS_CACHE_MS = 5 * 60 * 1000;
 const MAX_DELEGATION_MESSAGE_BYTES = 512 * 1024;
-const TASK_BASE_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
+const TASK_BASE_PATTERN = /^[a-z][a-z0-9]{1,15}(?:_[a-z0-9]{1,15}){1,3}$/;
+const GENERIC_TASK_BASES = new Set(["deepseek_job", "subagent_job", "worker_task"]);
+const PREPARED_TASK_PATTERN = /^(?:\/root\/)?([a-z][a-z0-9_]{0,31}_[a-f0-9]{24})$/;
 let modelsCache = null;
 const settingsCredentialPool = new CredentialRuntimePool();
 let settingsMutationQueue = Promise.resolve();
@@ -161,6 +163,24 @@ const tools = [
       ui: { visibility: ["model"] },
       "openai/toolInvocation/invoking": "Preparing native DeepSeek delegation",
       "openai/toolInvocation/invoked": "Native DeepSeek delegation ready",
+    },
+  },
+  {
+    name: "deepseek_followup_prepare", title: "Prepare native DeepSeek follow-up",
+    description: "Stage one bounded follow-up for an existing native DeepSeek child before followup_task. Pass the exact existing task path; it never calls a model.",
+    inputSchema: {
+      type: "object", additionalProperties: false, required: ["taskName", "message"],
+      properties: {
+        taskName: { type: "string", minLength: 1, maxLength: 256, pattern: PREPARED_TASK_PATTERN.source },
+        message: { type: "string", minLength: 1, maxLength: MAX_DELEGATION_MESSAGE_BYTES },
+      },
+    },
+    outputSchema: delegationOutputSchema(),
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+    _meta: {
+      ui: { visibility: ["model"] },
+      "openai/toolInvocation/invoking": "Preparing native DeepSeek follow-up",
+      "openai/toolInvocation/invoked": "Native DeepSeek follow-up ready",
     },
   },
   {
@@ -309,6 +329,9 @@ function classifiedError(error) {
     [/Settings changed|changed while|busy in another Codex task/i, "SETTINGS_CONFLICT"],
     [/timed out/i, "UPSTREAM_TIMEOUT"],
     [/Unable to reach DeepSeek/i, "NETWORK_UNREACHABLE"],
+    [/TASK_BINDING_REQUIRED/i, "TASK_BINDING_REQUIRED"],
+    [/FOLLOWUP_ALREADY_PENDING/i, "FOLLOWUP_ALREADY_PENDING"],
+    [/delegation .*capacity is exhausted/i, "DELEGATION_CAPACITY"],
     [/returned HTTP (\d+)/i, "UPSTREAM_HTTP_ERROR"],
     [/invalid JSON|invalid response|invalid model list|no valid model IDs/i, "UPSTREAM_INVALID_RESPONSE"],
     [/native integration is not ready/i, "NATIVE_NOT_READY"],
@@ -709,9 +732,34 @@ async function prepareNativeDelegation(args) {
   if (!validDelegationMessage(args?.message)) {
     throw new Error("Delegation message must be non-empty and no larger than 512 KiB.");
   }
-  if (!TASK_BASE_PATTERN.test(args?.taskName || "")) {
-    throw new Error("Spawn taskName must start with a lowercase letter and contain at most 32 lowercase letters, digits, or underscores.");
+  if (!TASK_BASE_PATTERN.test(args?.taskName || "") || args.taskName.length > 32 ||
+      GENERIC_TASK_BASES.has(args.taskName) || /^worker_[a-z0-9]+$/.test(args.taskName)) {
+    throw new Error("Spawn taskName must be a readable two-to-four-word snake_case name of at most 32 characters, such as router_binding_fix.");
   }
+  const runtime = await nativeDelegationRuntime();
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/delegations/prepare`, {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify({ taskName: args.taskName, message: args.message }),
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    throw new Error("Unable to reach the local DeepSeek delegation router.");
+  }
+  if (!response.ok) throw await routerControlFailure(response, "Local DeepSeek delegation preparation");
+  const prepared = await parseDelegationPreparation(response);
+  const validReturnedTask = new RegExp(`^${args.taskName}_[a-f0-9]{24}$`).test(prepared.taskName);
+  if (!validReturnedTask) throw new Error("Local DeepSeek delegation router returned invalid preparation metadata.");
+  return {
+    taskName: prepared.taskName,
+    expiresInSeconds: prepared.expiresInSeconds,
+    message: "Call native spawn_agent now with this exact taskName, agent_type deepseek, and fork_turns none.",
+  };
+}
+
+async function nativeDelegationRuntime() {
   const settings = await readSettings();
   if (!enabledCredentials(settings).length || !settings.model) {
     throw new Error("DeepSeek native delegation is not configured. Enable a connection and save a model first.");
@@ -742,32 +790,59 @@ async function prepareNativeDelegation(args) {
       !/^[a-f0-9]{48}$/.test(runtime.shutdownToken || "")) {
     throw new Error("DeepSeek router runtime state does not match the saved model.");
   }
-  let response;
-  try {
-    response = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/delegations/prepare`, {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify({ taskName: args.taskName, message: args.message }),
-      signal: AbortSignal.timeout(3_000),
-    });
-  } catch {
-    throw new Error("Unable to reach the local DeepSeek delegation router.");
-  }
-  if (!response.ok) throw new Error(`Local DeepSeek delegation preparation failed with HTTP ${response.status}.`);
+  return runtime;
+}
+
+async function parseDelegationPreparation(response) {
   const text = await response.text();
   if (Buffer.byteLength(text, "utf8") > 4096) throw new Error("Local DeepSeek delegation router returned an oversized response.");
   let prepared;
   try { prepared = JSON.parse(text); }
   catch { throw new Error("Local DeepSeek delegation router returned invalid JSON."); }
-  const validReturnedTask = new RegExp(`^${args.taskName}_[a-f0-9]{24}$`).test(prepared?.taskName || "");
-  if (!validReturnedTask || !Number.isInteger(prepared?.expiresInSeconds) ||
+  if (typeof prepared?.taskName !== "string" || !Number.isInteger(prepared?.expiresInSeconds) ||
       prepared.expiresInSeconds < 1 || prepared.expiresInSeconds > 600) {
     throw new Error("Local DeepSeek delegation router returned invalid preparation metadata.");
   }
+  return prepared;
+}
+
+async function routerControlFailure(response, operation) {
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > 4096) return new Error(`${operation} failed with HTTP ${response.status}.`);
+  let code = "";
+  try {
+    const payload = JSON.parse(text);
+    if (/^[A-Z0-9_]{3,64}$/.test(payload?.error?.code || "")) code = payload.error.code;
+  } catch {}
+  return new Error(`${operation} failed with HTTP ${response.status}${code ? ` [${code}]` : ""}.`);
+}
+
+async function prepareNativeFollowup(args) {
+  if (!validDelegationMessage(args?.message)) {
+    throw new Error("Follow-up message must be non-empty and no larger than 512 KiB.");
+  }
+  const match = String(args?.taskName || "").match(PREPARED_TASK_PATTERN);
+  if (!match) throw new Error("Follow-up taskName must be the exact prepared DeepSeek task name or canonical /root task path.");
+  const taskName = match[1];
+  const runtime = await nativeDelegationRuntime();
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/delegations/followup`, {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify({ taskName, message: args.message }),
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch {
+    throw new Error("Unable to reach the local DeepSeek delegation router.");
+  }
+  if (!response.ok) throw await routerControlFailure(response, "Local DeepSeek follow-up preparation");
+  const prepared = await parseDelegationPreparation(response);
+  if (prepared.taskName !== taskName) throw new Error("Local DeepSeek router returned the wrong follow-up task binding.");
   return {
     taskName: prepared.taskName,
     expiresInSeconds: prepared.expiresInSeconds,
-    message: "Call native spawn_agent now with this exact taskName, agent_type deepseek, and fork_turns none.",
+    message: "Call native followup_task now with this exact existing task path and the same bounded message.",
   };
 }
 
@@ -778,6 +853,10 @@ async function callTool(name, args) {
   case "deepseek_delegation_prepare": {
     const prepared = await prepareNativeDelegation(args);
     return resultText("Native DeepSeek delegation prepared in loopback memory.", prepared);
+  }
+  case "deepseek_followup_prepare": {
+    const prepared = await prepareNativeFollowup(args);
+    return resultText("Native DeepSeek follow-up prepared in loopback memory.", prepared);
   }
   case "deepseek_connection_save": {
     const baseUrl = normalizeApiBaseUrl(args?.baseUrl);

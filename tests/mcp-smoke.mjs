@@ -86,10 +86,14 @@ try {
   assert.match(skillContract, /FINAL_ANSWER[\s\S]*do not\s+call `wait_agent`/);
   assert.match(skillContract, /timeout means only that no new mailbox event arrived/);
   assert.match(skillContract, /Read the matching task\s+with `list_agents`/);
+  assert.match(skillContract, /two to four concise lowercase `snake_case` words/);
+  assert.match(skillContract, /`deepseek_followup_prepare`[\s\S]*immediately call `followup_task`/);
   const teamSkillContract = await readFile(join(root, "plugins/deepseek-subagent/skills/deepseek-team/SKILL.md"), "utf8");
   assert.match(teamSkillContract, /GPT as the accountable lead and DeepSeek as the fast, cost-efficient\s+executor/);
   assert.match(teamSkillContract, /DeepSeek subagent skill.*owns the native\s+delegation protocol/s);
   assert.match(teamSkillContract, /prepare\s+one delegation and immediately spawn its matching native child/);
+  assert.match(teamSkillContract, /two to four concise `snake_case` words/);
+  assert.match(teamSkillContract, /`deepseek_followup_prepare` and then immediately\s+`followup_task`/);
   assert.match(teamSkillContract, /Treat child reports as leads, not proof/);
   assert.match(teamSkillContract, /Do not delegate secrets, credential handling, production writes/);
   assert.match(teamSkillContract, /Do not silently substitute GPT execution/);
@@ -99,9 +103,13 @@ try {
   const listed = (await rpc("tools/list")).result.tools;
   assert(listed.some((tool) => tool.name === "deepseek_models_list"));
   assert(listed.some((tool) => tool.name === "deepseek_delegation_prepare"));
+  assert(listed.some((tool) => tool.name === "deepseek_followup_prepare"));
   const prepareTool = listed.find((tool) => tool.name === "deepseek_delegation_prepare");
   assert.equal(prepareTool._meta?.ui?.resourceUri, undefined);
   assert.equal(prepareTool._meta?.["openai/outputTemplate"], undefined);
+  const followupTool = listed.find((tool) => tool.name === "deepseek_followup_prepare");
+  assert.equal(followupTool._meta?.ui?.resourceUri, undefined);
+  assert.equal(followupTool._meta?.["openai/outputTemplate"], undefined);
   assert.match(listed.find((tool) => tool.name === "deepseek_settings").description, /Never use this tool as a routine delegation readiness check/);
   assert(!listed.some((tool) => ["analyze", "implement"].includes(tool.name)));
   assert(!JSON.stringify(listed).includes("deepseek-mock-a"));
@@ -196,6 +204,8 @@ try {
   const catalog = JSON.parse(await readFile(join(temp, "native-models.json"), "utf8"));
   assert.deepEqual(catalog.models.map((model) => model.slug), ["deepseek-mock-a", "deepseek-mock-b", "deepseek-flash"]);
   assert(catalog.models.every((model) => model.visibility === "hide" && Number.isInteger(model.priority) && model.priority >= 10_000));
+  assert(catalog.models.every((model) => model.context_window === 1_000_000 && model.max_context_window === 1_000_000));
+  assert(catalog.models.every((model) => model.effective_context_window_percent === 95));
   assert.deepEqual(catalog.models.find((model) => model.slug === "deepseek-flash").input_modalities, ["text", "image"]);
   const routedConfig = await readFile(join(codexHome, "config.toml"), "utf8");
   assert(routedConfig.includes('model_provider = "deepseek-subagent-router"'));
@@ -229,6 +239,47 @@ try {
   assert.equal(routedDelegation.status, 200);
   assert(JSON.stringify(lastResponsesPayload).includes(delegationCanary));
   assert(!JSON.stringify(lastResponsesPayload).includes("mcp-smoke-ciphertext"));
+  const followupCanary = "followup-canary-mcp-smoke-only";
+  const followupPrepared = (await rpc("tools/call", {
+    name: "deepseek_followup_prepare",
+    arguments: { taskName: `/root/${result.structuredContent.taskName}`, message: followupCanary },
+  })).result;
+  assert.equal(followupPrepared.isError, undefined);
+  assert.equal(followupPrepared.structuredContent.taskName, result.structuredContent.taskName);
+  assert(!JSON.stringify(followupPrepared).includes(followupCanary));
+  const duplicateFollowupPreparation = (await rpc("tools/call", {
+    name: "deepseek_followup_prepare",
+    arguments: { taskName: `/root/${result.structuredContent.taskName}`, message: "must fail while pending" },
+  })).result;
+  assert.equal(duplicateFollowupPreparation.isError, true);
+  assert.equal(duplicateFollowupPreparation._meta.deepseekSubagentError.code, "FOLLOWUP_ALREADY_PENDING");
+  const routedFollowup = await fetch(`http://127.0.0.1:${runtime.port}/${runtime.routeToken}/v1/responses`, {
+    method: "POST",
+    headers: { authorization: "Bearer parent-secret-do-not-forward", "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "deepseek-mock-a",
+      input: [
+        { type: "agent_message", role: "assistant", content: [
+          { type: "input_text", text: `Message Type: NEW_TASK\nTask name: /root/${result.structuredContent.taskName}\nSender: /root\nPayload:\n` },
+          { type: "encrypted_content", encrypted_content: "mcp-smoke-ciphertext" },
+        ] },
+        { type: "agent_message", role: "assistant", content: [
+          { type: "input_text", text: `Message Type: NEW_TASK\nTask name: /root/${result.structuredContent.taskName}\nSender: /root\nPayload:\n` },
+          { type: "encrypted_content", encrypted_content: "mcp-followup-ciphertext" },
+        ] },
+      ],
+    }),
+  });
+  assert.equal(routedFollowup.status, 200);
+  assert(JSON.stringify(lastResponsesPayload).includes(delegationCanary));
+  assert(JSON.stringify(lastResponsesPayload).includes(followupCanary));
+  assert(!JSON.stringify(lastResponsesPayload).includes("mcp-followup-ciphertext"));
+  const missingFollowupPreparation = (await rpc("tools/call", {
+    name: "deepseek_followup_prepare",
+    arguments: { taskName: "missing_task_aaaaaaaaaaaaaaaaaaaaaaaa", message: "must fail closed" },
+  })).result;
+  assert.equal(missingFollowupPreparation.isError, true);
+  assert.equal(missingFollowupPreparation._meta.deepseekSubagentError.code, "TASK_BINDING_REQUIRED");
   result = (await rpc("tools/call", { name: "deepseek_connection_test", arguments: { model: "deepseek-mock-b" } })).result;
   assert.equal(result.isError, undefined);
   assert.equal(lastResponsesPayload.model, "deepseek-mock-b");
